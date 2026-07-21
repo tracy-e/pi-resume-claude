@@ -358,8 +358,9 @@ class CliTests(unittest.TestCase):
                 self.assertEqual(code, 0)
                 self.assertEqual(json.loads(out)["session_id"], uid)
 
-                # `-c` is a leading-dash ref; `--` keeps it a positional, not a flag.
-                code, out, _ = self._run(["claude", "show", "--cwd", FAKE_CWD, "--json", "--", "-c"])
+                # `continue` is an alias for the newest session (leading-dash forms
+                # like `-c` are normalized to `latest` by the extension, not argv).
+                code, out, _ = self._run(["claude", "show", "continue", "--cwd", FAKE_CWD, "--json"])
                 self.assertEqual(code, 0)
                 self.assertEqual(json.loads(out)["session_id"], uid)
 

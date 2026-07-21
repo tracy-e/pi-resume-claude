@@ -116,8 +116,11 @@ async function listSessions(python: string, cwd: string): Promise<ReaderResult<S
 }
 
 async function showSession(python: string, cwd: string, ref: string): Promise<ReaderResult<ShowResult>> {
-	// `--` keeps a leading-dash ref (e.g. -c) as the positional, not an option flag.
-	const r = await runReader(python, [TOOL, "show", "--cwd", cwd, "--json", "--", ref]);
+	// Map Claude's "continue most recent" spellings onto the reader's `latest` here
+	// so a leading-dash ref (-c) never reaches the reader's argument parser, where
+	// argparse would treat it as an unknown option (portability across Python).
+	const resolved = /^(--continue|continue|-c)$/i.test(ref.trim()) ? "latest" : ref;
+	const r = await runReader(python, [TOOL, "show", resolved, "--cwd", cwd, "--json"]);
 	if (r.status !== 0) {
 		const message = (r.stderr || r.stdout || "show failed").trim();
 		// Ambiguous free-text matches are printed to stderr; recover via list filter.
