@@ -1632,6 +1632,29 @@ def read_cursor_session(
     return _finalize_result(result)
 
 
+def _claude_quick_cwd(path: Path) -> str | None:
+    """Extract a session's cwd cheaply, stopping at the first record that has
+    one. Lets discovery skip full parent-chain reconstruction for sessions that
+    belong to a different working directory (the common case when every project
+    directory is scanned)."""
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                if not line.strip():
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(record, dict):
+                    value = record.get("cwd")
+                    if isinstance(value, str) and value:
+                        return value
+    except OSError:
+        return None
+    return None
+
+
 def _discover_claude(cwd: str, within_min: int) -> list[dict[str, Any]]:
     projects = _claude_config_dir() / "projects"
     if not projects.is_dir():
@@ -1666,6 +1689,15 @@ def _discover_claude(cwd: str, within_min: int) -> list[dict[str, Any]]:
                 continue
             updated = _mtime_millis(path)
             if not _within(updated, within_min):
+                continue
+            # Cheap pre-filter: avoid the expensive full parse for sessions that
+            # clearly belong to another cwd. Sessions with no recoverable cwd are
+            # only kept under the expected (slugified) project directory, which
+            # mirrors the post-parse check below.
+            quick_cwd = _claude_quick_cwd(path)
+            if quick_cwd is not None and os.path.normpath(quick_cwd) != os.path.normpath(cwd):
+                continue
+            if quick_cwd is None and project != expected:
                 continue
             try:
                 result = read_claude_session(path, max_tool_chars=80)

@@ -79,13 +79,21 @@ function runReader(python: string, args: string[]): { status: number; stdout: st
 	};
 }
 
+// Match the reader's free-text comparison: lower-case + whitespace-normalized
+// substring test (Python side uses casefold + " ".join(text.split())).
+function normalizeForMatch(text: string): string {
+	return text.toLowerCase().replace(/\s+/g, " ").trim();
+}
+
 function parseJsonLoose(text: string): unknown {
 	const trimmed = text.trim();
 	if (!trimmed) return undefined;
 	try {
 		return JSON.parse(trimmed);
 	} catch {
-		// Some environments may wrap JSON; try first { ... } span.
+		// Fallback only: the reader emits a single pure JSON document, so this
+		// brace-span salvage is a defensive guard against unexpected wrapping,
+		// not a supported multi-object format.
 		const start = trimmed.indexOf("{");
 		const end = trimmed.lastIndexOf("}");
 		if (start >= 0 && end > start) {
@@ -116,9 +124,9 @@ function showSession(python: string, cwd: string, ref: string): ReaderResult<Sho
 		if (/matched \d+ sessions/i.test(message)) {
 			const listed = listSessions(python, cwd);
 			if (listed.ok) {
-				const query = ref.toLowerCase();
+				const query = normalizeForMatch(ref);
 				const matches = listed.data.filter((s) =>
-					(s.title || "").toLowerCase().includes(query),
+					normalizeForMatch(s.title || "").includes(query),
 				);
 				if (matches.length > 1) {
 					return { ok: false, message, matches };
@@ -143,7 +151,7 @@ function relativeTime(ms: number | null | undefined): string {
 	const min = Math.floor(sec / 60);
 	if (min < 60) return `${min}m ago`;
 	const hr = Math.floor(min / 60);
-	if (hr < 48) return `${hr}h ago`;
+	if (hr < 24) return `${hr}h ago`;
 	const day = Math.floor(hr / 24);
 	return `${day}d ago`;
 }
@@ -223,13 +231,28 @@ async function pickSession(
 ): Promise<SessionSummary | undefined> {
 	if (sessions.length === 0) return undefined;
 	if (sessions.length === 1) return sessions[0];
-	if (!ctx.hasUI) return sessions[0];
+	// No interactive UI: don't silently resume an arbitrary session — force the
+	// caller to disambiguate with an explicit id.
+	if (!ctx.hasUI) return undefined;
 
 	const labels = sessions.map(formatSessionLabel);
 	const selected = await ctx.ui.select(title, labels);
 	if (!selected) return undefined;
 	const index = labels.indexOf(selected);
 	return index >= 0 ? sessions[index] : undefined;
+}
+
+// Explain an empty pick: a headless multi-match needs an explicit id, whereas
+// an interactive empty result means the user cancelled.
+function notifyNoSelection(ctx: ExtensionCommandContext, candidates: SessionSummary[]): void {
+	if (!ctx.hasUI && candidates.length > 1) {
+		ctx.ui.notify(
+			"Multiple Claude sessions match; re-run /resume-claude with a session id.",
+			"warning",
+		);
+	} else {
+		ctx.ui.notify("Cancelled", "info");
+	}
 }
 
 async function resumeClaude(args: string, ctx: ExtensionCommandContext, pi: ExtensionAPI): Promise<void> {
@@ -261,7 +284,7 @@ async function resumeClaude(args: string, ctx: ExtensionCommandContext, pi: Exte
 		}
 		const picked = await pickSession(ctx, listed.data, "Resume Claude Code session");
 		if (!picked) {
-			ctx.ui.notify("Cancelled", "info");
+			notifyNoSelection(ctx, listed.data);
 			return;
 		}
 		const shown = showSession(python, cwd, picked.session_id);
@@ -276,7 +299,7 @@ async function resumeClaude(args: string, ctx: ExtensionCommandContext, pi: Exte
 			if (shown.matches && shown.matches.length > 0) {
 				const picked = await pickSession(ctx, shown.matches, `Multiple matches for "${ref}"`);
 				if (!picked) {
-					ctx.ui.notify("Cancelled", "info");
+					notifyNoSelection(ctx, shown.matches);
 					return;
 				}
 				const again = showSession(python, cwd, picked.session_id);

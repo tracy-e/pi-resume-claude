@@ -18,7 +18,17 @@ jobs:
           node-version: "22"
           registry-url: "https://registry.npmjs.org"
       - run: npm ci
+      - name: Verify tag matches package.json version
+        if: github.event_name == 'release'
+        run: |
+          pkg_version="$(node -p "require('./package.json').version")"
+          tag_version="${GITHUB_REF_NAME#v}"
+          if [ "$pkg_version" != "$tag_version" ]; then
+            echo "::error::release tag '$GITHUB_REF_NAME' does not match package.json version '$pkg_version'"
+            exit 1
+          fi
       - run: npx tsc --noEmit
+      - run: npm test
       - run: npm publish --access public --provenance
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

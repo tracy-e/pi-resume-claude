@@ -23,7 +23,8 @@
     "extensions",
     "skills",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "NOTICE"
   ],
   "pi": {
     "extensions": [
@@ -34,14 +35,15 @@
     ]
   },
   "scripts": {
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "python3 -m unittest discover -s tests -p 'test_*.py'"
   },
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": "*"
+    "@earendil-works/pi-coding-agent": ">=0.80.0"
   },
   "devDependencies": {
-    "@earendil-works/pi-coding-agent": "*",
-    "@types/node": "*",
+    "@earendil-works/pi-coding-agent": ">=0.80.0",
+    "@types/node": "^26.0.0",
     "typescript": "^5.8.0"
   },
   "engines": {
