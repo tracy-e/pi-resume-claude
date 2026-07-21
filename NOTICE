@@ -1,0 +1,3 @@
+This package includes `skills/resume-claude/scripts/session_reader.py` and the
+handoff workflow adapted from Grok Build's bundled `resume-claude` /
+`resume-session` skill (https://github.com/xai-org/grok-build).
