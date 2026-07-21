@@ -1,4 +1,4 @@
-# @tracy-e/pi-resume-claude
+# pi-resume-claude
 
 Resume Claude Code sessions inside Pi.
 
@@ -9,7 +9,7 @@ prompt into the current Pi session, and let the model summarize and continue.
 ## Install
 
 ```bash
-pi install npm:@tracy-e/pi-resume-claude
+pi install npm:pi-resume-claude
 ```
 
 Or install from GitHub:
@@ -91,7 +91,7 @@ python3 skills/resume-claude/scripts/session_reader.py claude show latest --cwd 
 ## Uninstall
 
 ```bash
-pi remove npm:@tracy-e/pi-resume-claude
+pi remove npm:pi-resume-claude
 ```
 
 ## License

@@ -1,5 +1,5 @@
 {
-  "name": "@tracy-e/pi-resume-claude",
+  "name": "pi-resume-claude",
   "version": "0.1.0",
   "description": "Resume Claude Code sessions inside Pi via /resume-claude",
   "keywords": [
