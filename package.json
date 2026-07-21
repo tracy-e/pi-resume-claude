@@ -1,0 +1,50 @@
+{
+  "name": "@tracy-e/pi-resume-claude",
+  "version": "0.1.0",
+  "description": "Resume Claude Code sessions inside Pi via /resume-claude",
+  "keywords": [
+    "pi-package",
+    "pi-coding-agent",
+    "pi-extension",
+    "claude-code",
+    "resume-session"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/tracy-e/pi-resume-claude.git"
+  },
+  "bugs": {
+    "url": "https://github.com/tracy-e/pi-resume-claude/issues"
+  },
+  "homepage": "https://github.com/tracy-e/pi-resume-claude#readme",
+  "license": "MIT",
+  "type": "module",
+  "files": [
+    "extensions",
+    "skills",
+    "README.md",
+    "LICENSE"
+  ],
+  "pi": {
+    "extensions": [
+      "./extensions/resume-claude.ts"
+    ],
+    "skills": [
+      "./skills/resume-claude"
+    ]
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@types/node": "*",
+    "typescript": "^5.8.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
