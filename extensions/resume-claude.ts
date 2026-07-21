@@ -79,8 +79,7 @@ function runReader(python: string, args: string[]): { status: number; stdout: st
 	};
 }
 
-// Match the reader's free-text comparison: lower-case + whitespace-normalized
-// substring test (Python side uses casefold + " ".join(text.split())).
+// Mirror the reader's free-text match: lower-cased, whitespace-normalized.
 function normalizeForMatch(text: string): string {
 	return text.toLowerCase().replace(/\s+/g, " ").trim();
 }
@@ -91,9 +90,7 @@ function parseJsonLoose(text: string): unknown {
 	try {
 		return JSON.parse(trimmed);
 	} catch {
-		// Fallback only: the reader emits a single pure JSON document, so this
-		// brace-span salvage is a defensive guard against unexpected wrapping,
-		// not a supported multi-object format.
+		// Defensive fallback: reader emits pure JSON; salvage a brace span if wrapped.
 		const start = trimmed.indexOf("{");
 		const end = trimmed.lastIndexOf("}");
 		if (start >= 0 && end > start) {
@@ -231,8 +228,7 @@ async function pickSession(
 ): Promise<SessionSummary | undefined> {
 	if (sessions.length === 0) return undefined;
 	if (sessions.length === 1) return sessions[0];
-	// No interactive UI: don't silently resume an arbitrary session — force the
-	// caller to disambiguate with an explicit id.
+	// No UI: force an explicit id rather than silently pick one.
 	if (!ctx.hasUI) return undefined;
 
 	const labels = sessions.map(formatSessionLabel);
@@ -242,8 +238,7 @@ async function pickSession(
 	return index >= 0 ? sessions[index] : undefined;
 }
 
-// Explain an empty pick: a headless multi-match needs an explicit id, whereas
-// an interactive empty result means the user cancelled.
+// Headless multi-match needs an explicit id; otherwise an empty pick is a cancel.
 function notifyNoSelection(ctx: ExtensionCommandContext, candidates: SessionSummary[]): void {
 	if (!ctx.hasUI && candidates.length > 1) {
 		ctx.ui.notify(

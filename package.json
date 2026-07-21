@@ -20,8 +20,10 @@
   "license": "MIT",
   "type": "module",
   "files": [
-    "extensions",
-    "skills",
+    "extensions/resume-claude.ts",
+    "skills/resume-claude/SKILL.md",
+    "skills/resume-claude/references/CORE.md",
+    "skills/resume-claude/scripts/session_reader.py",
     "README.md",
     "LICENSE",
     "NOTICE"
@@ -36,7 +38,7 @@
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "python3 -m unittest discover -s tests -p 'test_*.py'"
+    "test": "python3 -B -m unittest discover -s tests -p 'test_*.py'"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": ">=0.80.0"

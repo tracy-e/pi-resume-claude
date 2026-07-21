@@ -1632,11 +1632,15 @@ def read_cursor_session(
     return _finalize_result(result)
 
 
-def _claude_quick_cwd(path: Path) -> str | None:
-    """Extract a session's cwd cheaply, stopping at the first record that has
-    one. Lets discovery skip full parent-chain reconstruction for sessions that
-    belong to a different working directory (the common case when every project
-    directory is scanned)."""
+def _claude_cwd_prefilter(path: Path, target: str) -> str:
+    """Cheap discovery pre-filter. Scans every record's cwd (not just the first,
+    which may be a leading orphan differing from the leaf-chain cwd):
+      "match"   - some record's cwd equals target
+      "foreign" - records had cwd(s) but none matched
+      "absent"  - no record carried a cwd
+    """
+    target_norm = os.path.normpath(target)
+    saw_cwd = False
     try:
         with path.open("r", encoding="utf-8", errors="replace") as handle:
             for line in handle:
@@ -1649,10 +1653,12 @@ def _claude_quick_cwd(path: Path) -> str | None:
                 if isinstance(record, dict):
                     value = record.get("cwd")
                     if isinstance(value, str) and value:
-                        return value
+                        saw_cwd = True
+                        if os.path.normpath(value) == target_norm:
+                            return "match"
     except OSError:
-        return None
-    return None
+        return "absent"
+    return "foreign" if saw_cwd else "absent"
 
 
 def _discover_claude(cwd: str, within_min: int) -> list[dict[str, Any]]:
@@ -1690,14 +1696,12 @@ def _discover_claude(cwd: str, within_min: int) -> list[dict[str, Any]]:
             updated = _mtime_millis(path)
             if not _within(updated, within_min):
                 continue
-            # Cheap pre-filter: avoid the expensive full parse for sessions that
-            # clearly belong to another cwd. Sessions with no recoverable cwd are
-            # only kept under the expected (slugified) project directory, which
-            # mirrors the post-parse check below.
-            quick_cwd = _claude_quick_cwd(path)
-            if quick_cwd is not None and os.path.normpath(quick_cwd) != os.path.normpath(cwd):
+            # Skip the full parse for foreign transcripts; keep cwd-less ones
+            # only under the expected project dir (mirrors the post-parse check).
+            prefilter = _claude_cwd_prefilter(path, cwd)
+            if prefilter == "foreign":
                 continue
-            if quick_cwd is None and project != expected:
+            if prefilter == "absent" and project != expected:
                 continue
             try:
                 result = read_claude_session(path, max_tool_chars=80)

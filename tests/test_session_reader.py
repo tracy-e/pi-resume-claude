@@ -233,7 +233,7 @@ class DiscoverAndResolveTests(unittest.TestCase):
                 with self.assertRaises(sr.AmbiguousReference):
                     sr.resolve_session("claude", "e", FAKE_CWD)
 
-    def test_quick_cwd_filters_foreign_sessions(self):
+    def test_prefilter_filters_foreign_sessions(self):
         with TemporaryDirectory() as tmp:
             projects = Path(tmp) / "projects" / sr.slugify(FAKE_CWD)
             projects.mkdir(parents=True)
@@ -244,6 +244,45 @@ class DiscoverAndResolveTests(unittest.TestCase):
             with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": tmp}):
                 sessions = sr.discover_sessions("claude", FAKE_CWD)
             self.assertEqual([s["title"] for s in sessions], ["Mine"])
+
+    def test_prefilter_keeps_session_with_leading_foreign_cwd(self):
+        # Regression: a leading foreign cwd must not veto a target-cwd leaf chain.
+        uid = "33333333-3333-4333-8333-333333333333"
+        records = [
+            {
+                "type": "user",
+                "uuid": "orphan",
+                "parentUuid": None,
+                "timestamp": "2026-07-20T08:00:00Z",
+                "cwd": "/some/other/place",
+                "message": {"role": "user", "content": [{"type": "text", "text": "old branch"}]},
+            },
+            {
+                "type": "user",
+                "uuid": "u1",
+                "parentUuid": None,
+                "timestamp": "2026-07-20T10:00:00Z",
+                "cwd": FAKE_CWD,
+                "gitBranch": "main",
+                "message": {"role": "user", "content": [{"type": "text", "text": "real work"}]},
+            },
+            {
+                "type": "assistant",
+                "uuid": "a1",
+                "parentUuid": "u1",
+                "timestamp": "2026-07-20T10:00:05Z",
+                "cwd": FAKE_CWD,
+                "gitBranch": "main",
+                "message": {"role": "assistant", "content": [{"type": "text", "text": "on it"}]},
+            },
+        ]
+        with TemporaryDirectory() as tmp:
+            projects = Path(tmp) / "projects" / sr.slugify(FAKE_CWD)
+            projects.mkdir(parents=True)
+            _write_jsonl(projects / f"{uid}.jsonl", records)
+            with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": tmp}):
+                sessions = sr.discover_sessions("claude", FAKE_CWD)
+        self.assertEqual([s["session_id"] for s in sessions], [uid])
 
 
 class CliTests(unittest.TestCase):
