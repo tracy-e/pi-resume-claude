@@ -1632,15 +1632,24 @@ def read_cursor_session(
     return _finalize_result(result)
 
 
+# cwd rides on every record's envelope near the top of a transcript, so a
+# match/foreign verdict is reachable within the first few records. Scanning the
+# whole (often multi-MB) file just to reject a foreign transcript is what made
+# discovery read gigabytes across thousands of files. Bound the scan: keep the
+# leading-orphan defense (look past the first record) but stop once this many
+# non-matching cwd records have been seen.
+_PREFILTER_MAX_CWD_RECORDS = 8
+
+
 def _claude_cwd_prefilter(path: Path, target: str) -> str:
-    """Cheap discovery pre-filter. Scans every record's cwd (not just the first,
-    which may be a leading orphan differing from the leaf-chain cwd):
-      "match"   - some record's cwd equals target
-      "foreign" - records had cwd(s) but none matched
-      "absent"  - no record carried a cwd
+    """Cheap discovery pre-filter. Scans the leading records' cwd (not just the
+    first, which may be a leading orphan differing from the leaf-chain cwd):
+      "match"   - some leading record's cwd equals target
+      "foreign" - leading records had cwd(s) but none matched
+      "absent"  - no leading record carried a cwd
     """
     target_norm = os.path.normpath(target)
-    saw_cwd = False
+    cwd_seen = 0
     try:
         with path.open("r", encoding="utf-8", errors="replace") as handle:
             for line in handle:
@@ -1653,12 +1662,14 @@ def _claude_cwd_prefilter(path: Path, target: str) -> str:
                 if isinstance(record, dict):
                     value = record.get("cwd")
                     if isinstance(value, str) and value:
-                        saw_cwd = True
                         if os.path.normpath(value) == target_norm:
                             return "match"
+                        cwd_seen += 1
+                        if cwd_seen >= _PREFILTER_MAX_CWD_RECORDS:
+                            return "foreign"
     except OSError:
         return "absent"
-    return "foreign" if saw_cwd else "absent"
+    return "foreign" if cwd_seen else "absent"
 
 
 def _discover_claude(cwd: str, within_min: int) -> list[dict[str, Any]]:
@@ -1698,8 +1709,13 @@ def _discover_claude(cwd: str, within_min: int) -> list[dict[str, Any]]:
                 continue
             # Skip the full parse for foreign transcripts; keep cwd-less ones
             # only under the expected project dir (mirrors the post-parse check).
+            # In the expected (own-slug) dir a bounded "foreign" verdict can be a
+            # false negative -- a leading-orphan chain longer than the scan bound
+            # hides the matching leaf cwd -- so fall through to the authoritative
+            # post-parse cwd check there; only cheaply veto foreign transcripts
+            # sitting in *other* project dirs.
             prefilter = _claude_cwd_prefilter(path, cwd)
-            if prefilter == "foreign":
+            if prefilter == "foreign" and project != expected:
                 continue
             if prefilter == "absent" and project != expected:
                 continue
@@ -2049,6 +2065,10 @@ def _find_cursor_id(session_id: str, cwd: str) -> dict[str, Any] | None:
     return None
 
 
+# "latest" plus the "continue most recent" spellings Claude Code itself uses.
+_LATEST_ALIASES = frozenset({"latest", "continue", "--continue", "-c"})
+
+
 def resolve_session(
     tool: str,
     reference: str | None,
@@ -2056,7 +2076,7 @@ def resolve_session(
     within_min: int = 0,
 ) -> dict[str, Any]:
     ref = (reference or "").strip()
-    if not ref or ref.casefold() == "latest":
+    if not ref or ref.casefold() in _LATEST_ALIASES:
         ref = "latest"
     path_candidate = _candidate_from_path(tool, ref, cwd)
     if path_candidate is not None:

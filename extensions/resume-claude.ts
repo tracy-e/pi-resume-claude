@@ -8,13 +8,13 @@
  *   4. Inject a handoff prompt so the agent can continue safely
  *
  * Usage:
- *   /resume-claude
- *   /resume-claude latest
+ *   /resume-claude            list sessions and pick (prints ids when headless)
+ *   /resume-claude latest     resume the newest session (aliases: continue, -c)
  *   /resume-claude <session-id>
  *   /resume-claude <words from title>
  */
 
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -66,17 +66,19 @@ function findPython(): string | undefined {
 	return undefined;
 }
 
-function runReader(python: string, args: string[]): { status: number; stdout: string; stderr: string } {
-	const r = spawnSync(python, [READER, ...args], {
-		encoding: "utf-8",
-		maxBuffer: 32 * 1024 * 1024,
-		env: process.env,
+// Async so a slow scan never blocks the TUI event loop (spawnSync froze the UI).
+function runReader(python: string, args: string[]): Promise<{ status: number; stdout: string; stderr: string }> {
+	return new Promise((resolve) => {
+		const child = spawn(python, [READER, ...args], { env: process.env });
+		let stdout = "";
+		let stderr = "";
+		child.stdout.setEncoding("utf-8");
+		child.stderr.setEncoding("utf-8");
+		child.stdout.on("data", (chunk) => (stdout += chunk));
+		child.stderr.on("data", (chunk) => (stderr += chunk));
+		child.on("error", (err) => resolve({ status: 1, stdout, stderr: stderr || String(err) }));
+		child.on("close", (code) => resolve({ status: code ?? 1, stdout, stderr }));
 	});
-	return {
-		status: r.status ?? 1,
-		stdout: r.stdout ?? "",
-		stderr: r.stderr ?? "",
-	};
 }
 
 // Mirror the reader's free-text match: lower-cased, whitespace-normalized.
@@ -100,8 +102,8 @@ function parseJsonLoose(text: string): unknown {
 	}
 }
 
-function listSessions(python: string, cwd: string): ReaderResult<SessionSummary[]> {
-	const r = runReader(python, [TOOL, "list", "--cwd", cwd, "--json"]);
+async function listSessions(python: string, cwd: string): Promise<ReaderResult<SessionSummary[]>> {
+	const r = await runReader(python, [TOOL, "list", "--cwd", cwd, "--json"]);
 	if (r.status !== 0) {
 		return { ok: false, message: (r.stderr || r.stdout || "list failed").trim() };
 	}
@@ -113,13 +115,14 @@ function listSessions(python: string, cwd: string): ReaderResult<SessionSummary[
 	}
 }
 
-function showSession(python: string, cwd: string, ref: string): ReaderResult<ShowResult> {
-	const r = runReader(python, [TOOL, "show", ref, "--cwd", cwd, "--json"]);
+async function showSession(python: string, cwd: string, ref: string): Promise<ReaderResult<ShowResult>> {
+	// `--` keeps a leading-dash ref (e.g. -c) as the positional, not an option flag.
+	const r = await runReader(python, [TOOL, "show", "--cwd", cwd, "--json", "--", ref]);
 	if (r.status !== 0) {
 		const message = (r.stderr || r.stdout || "show failed").trim();
 		// Ambiguous free-text matches are printed to stderr; recover via list filter.
 		if (/matched \d+ sessions/i.test(message)) {
-			const listed = listSessions(python, cwd);
+			const listed = await listSessions(python, cwd);
 			if (listed.ok) {
 				const query = normalizeForMatch(ref);
 				const matches = listed.data.filter((s) =>
@@ -157,11 +160,32 @@ function shortId(id: string): string {
 	return id.length > 8 ? id.slice(0, 8) : id;
 }
 
+function cleanTitle(s: SessionSummary): string {
+	return (s.title || "(untitled)").replace(/\s+/g, " ").trim();
+}
+
+function branchSuffix(s: SessionSummary): string {
+	return s.branch ? ` · ${s.branch}` : "";
+}
+
 function formatSessionLabel(s: SessionSummary): string {
-	const title = (s.title || "(untitled)").replace(/\s+/g, " ").trim();
+	const title = cleanTitle(s);
 	const clipped = title.length > 72 ? `${title.slice(0, 69)}...` : title;
-	const branch = s.branch ? ` · ${s.branch}` : "";
-	return `${relativeTime(s.updated_at_ms)} · ${clipped}${branch} · ${shortId(s.session_id)}`;
+	return `${relativeTime(s.updated_at_ms)} · ${clipped}${branchSuffix(s)} · ${shortId(s.session_id)}`;
+}
+
+// Copy-friendly enumeration for when no picker UI is available (headless).
+function renderSessionList(sessions: SessionSummary[], cwd: string): string {
+	const rows = sessions.map(
+		(s, i) =>
+			`${i + 1}. ${relativeTime(s.updated_at_ms)} · ${cleanTitle(s)}${branchSuffix(s)}\n   ${s.session_id}`,
+	);
+	return [
+		`Claude Code sessions for ${cwd} (${sessions.length}):`,
+		...rows,
+		"",
+		"Resume one with /resume-claude <session-id>.",
+	].join("\n");
 }
 
 function buildHandoffPrompt(session: ShowResult): string {
@@ -238,13 +262,11 @@ async function pickSession(
 	return index >= 0 ? sessions[index] : undefined;
 }
 
-// Headless multi-match needs an explicit id; otherwise an empty pick is a cancel.
+// Headless multi-match needs an explicit id; print the ids so one is pickable.
+// Otherwise an empty pick is a cancel.
 function notifyNoSelection(ctx: ExtensionCommandContext, candidates: SessionSummary[]): void {
 	if (!ctx.hasUI && candidates.length > 1) {
-		ctx.ui.notify(
-			"Multiple Claude sessions match; re-run /resume-claude with a session id.",
-			"warning",
-		);
+		ctx.ui.notify(renderSessionList(candidates, ctx.cwd), "info");
 	} else {
 		ctx.ui.notify("Cancelled", "info");
 	}
@@ -268,7 +290,7 @@ async function resumeClaude(args: string, ctx: ExtensionCommandContext, pi: Exte
 	let session: ShowResult | undefined;
 
 	if (!ref) {
-		const listed = listSessions(python, cwd);
+		const listed = await listSessions(python, cwd);
 		if (!listed.ok) {
 			ctx.ui.notify(listed.message, "error");
 			return;
@@ -277,19 +299,24 @@ async function resumeClaude(args: string, ctx: ExtensionCommandContext, pi: Exte
 			ctx.ui.notify(`No Claude Code sessions found for ${cwd}`, "warning");
 			return;
 		}
+		// No picker with several matches: print ids so the user can resume by id.
+		if (!ctx.hasUI && listed.data.length > 1) {
+			ctx.ui.notify(renderSessionList(listed.data, cwd), "info");
+			return;
+		}
 		const picked = await pickSession(ctx, listed.data, "Resume Claude Code session");
 		if (!picked) {
 			notifyNoSelection(ctx, listed.data);
 			return;
 		}
-		const shown = showSession(python, cwd, picked.session_id);
+		const shown = await showSession(python, cwd, picked.session_id);
 		if (!shown.ok) {
 			ctx.ui.notify(shown.message, "error");
 			return;
 		}
 		session = shown.data;
 	} else {
-		const shown = showSession(python, cwd, ref);
+		const shown = await showSession(python, cwd, ref);
 		if (!shown.ok) {
 			if (shown.matches && shown.matches.length > 0) {
 				const picked = await pickSession(ctx, shown.matches, `Multiple matches for "${ref}"`);
@@ -297,7 +324,7 @@ async function resumeClaude(args: string, ctx: ExtensionCommandContext, pi: Exte
 					notifyNoSelection(ctx, shown.matches);
 					return;
 				}
-				const again = showSession(python, cwd, picked.session_id);
+				const again = await showSession(python, cwd, picked.session_id);
 				if (!again.ok) {
 					ctx.ui.notify(again.message, "error");
 					return;
@@ -329,7 +356,13 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("resume-claude", {
 		description: "Continue from a Claude Code session",
 		handler: async (args, ctx) => {
-			await resumeClaude(args, ctx, pi);
+			// The scan can take a moment on large session stores; show it is working.
+			ctx.ui.setStatus("resume-claude", "Reading Claude sessions…");
+			try {
+				await resumeClaude(args, ctx, pi);
+			} finally {
+				ctx.ui.setStatus("resume-claude", undefined);
+			}
 		},
 	});
 }

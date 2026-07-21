@@ -43,8 +43,8 @@ Requirements:
 
 | Form | Behavior |
 | --- | --- |
-| no args | List Claude sessions for the current cwd and pick one |
-| `latest` | Resume the newest session |
+| no args | List Claude sessions for the current cwd and pick one (prints ids when headless) |
+| `latest` | Resume the newest session (aliases: `continue`, `-c`) |
 | session id | Resolve by native UUID |
 | free text | Match against titles; open a picker when ambiguous |
 

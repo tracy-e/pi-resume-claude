@@ -224,6 +224,12 @@ class DiscoverAndResolveTests(unittest.TestCase):
                 self.assertEqual(
                     sr.resolve_session("claude", "latest", FAKE_CWD)["session_id"], self.id_a
                 )
+                # `continue` / `-c` are aliases for the newest session.
+                for alias in ("continue", "--continue", "-c", "CONTINUE"):
+                    self.assertEqual(
+                        sr.resolve_session("claude", alias, FAKE_CWD)["session_id"],
+                        self.id_a,
+                    )
                 self.assertEqual(
                     sr.resolve_session("claude", self.id_b, FAKE_CWD)["session_id"], self.id_b
                 )
@@ -284,6 +290,51 @@ class DiscoverAndResolveTests(unittest.TestCase):
                 sessions = sr.discover_sessions("claude", FAKE_CWD)
         self.assertEqual([s["session_id"] for s in sessions], [uid])
 
+    def test_prefilter_keeps_own_dir_session_past_scan_bound(self):
+        # Regression: a leading-orphan chain longer than the bounded pre-filter
+        # scan must not veto a target-cwd leaf chain that lives in its own slug
+        # dir. The cheap "foreign" verdict is advisory there; the full parse's
+        # cwd check is authoritative.
+        uid = "44444444-4444-4444-8444-444444444444"
+        records = [
+            {
+                "type": "user",
+                "uuid": f"orphan{i}",
+                "parentUuid": None,
+                "timestamp": f"2026-07-20T08:{i:02d}:00Z",
+                "cwd": "/some/other/place",
+                "message": {"role": "user", "content": [{"type": "text", "text": f"old {i}"}]},
+            }
+            for i in range(sr._PREFILTER_MAX_CWD_RECORDS + 2)
+        ]
+        records += [
+            {
+                "type": "user",
+                "uuid": "u1",
+                "parentUuid": None,
+                "timestamp": "2026-07-20T10:00:00Z",
+                "cwd": FAKE_CWD,
+                "gitBranch": "main",
+                "message": {"role": "user", "content": [{"type": "text", "text": "real work"}]},
+            },
+            {
+                "type": "assistant",
+                "uuid": "a1",
+                "parentUuid": "u1",
+                "timestamp": "2026-07-20T10:00:05Z",
+                "cwd": FAKE_CWD,
+                "gitBranch": "main",
+                "message": {"role": "assistant", "content": [{"type": "text", "text": "on it"}]},
+            },
+        ]
+        with TemporaryDirectory() as tmp:
+            projects = Path(tmp) / "projects" / sr.slugify(FAKE_CWD)
+            projects.mkdir(parents=True)
+            _write_jsonl(projects / f"{uid}.jsonl", records)
+            with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": tmp}):
+                sessions = sr.discover_sessions("claude", FAKE_CWD)
+        self.assertEqual([s["session_id"] for s in sessions], [uid])
+
 
 class CliTests(unittest.TestCase):
     def _run(self, argv: list[str]) -> tuple[int, str, str]:
@@ -304,6 +355,11 @@ class CliTests(unittest.TestCase):
                 self.assertEqual(len(json.loads(out)["sessions"]), 1)
 
                 code, out, _ = self._run(["claude", "show", "latest", "--cwd", FAKE_CWD, "--json"])
+                self.assertEqual(code, 0)
+                self.assertEqual(json.loads(out)["session_id"], uid)
+
+                # `-c` is a leading-dash ref; `--` keeps it a positional, not a flag.
+                code, out, _ = self._run(["claude", "show", "--cwd", FAKE_CWD, "--json", "--", "-c"])
                 self.assertEqual(code, 0)
                 self.assertEqual(json.loads(out)["session_id"], uid)
 

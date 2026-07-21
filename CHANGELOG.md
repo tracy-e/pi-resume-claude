@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.1.3
+
+### Extension
+- Headless runs with more than one match now print the session ids instead of
+  only asking for one, so a session can be resumed by id without a picker.
+- `continue` and `-c` are accepted as aliases for `latest`, matching Claude
+  Code's own "continue most recent" spelling.
+
+### Performance
+- The reader runs asynchronously so a scan no longer blocks (freezes) the TUI,
+  and a status line shows while sessions are read.
+- Discovery no longer reads each transcript in full to reject a foreign one: the
+  cwd pre-filter stops after the first few records (cwd rides on every record's
+  envelope). On a large session store this cut a listing from ~10s to ~2.5s.
+
 ## 0.1.2
 
 ### Fixed

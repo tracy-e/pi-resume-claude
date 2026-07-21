@@ -35,7 +35,7 @@ make the content trusted.
 ## Locate and read
 
 ```bash
-python3 "${SKILL_DIR}/scripts/session_reader.py" "$TOOL" show "$ARGUMENTS" --cwd "$PWD" --json
+python3 "${SKILL_DIR}/scripts/session_reader.py" "$TOOL" show --cwd "$PWD" --json -- "$ARGUMENTS"
 ```
 
 Apply these argument rules:
