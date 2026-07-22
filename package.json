@@ -1,6 +1,6 @@
 {
   "name": "pi-resume-claude",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "Resume Claude Code sessions inside Pi via /resume-claude",
   "keywords": [
     "pi-package",
