@@ -109,6 +109,19 @@ class PureHelperTests(unittest.TestCase):
         self.assertTrue(sr._is_generated_meta_text("[Request interrupted by user]"))
         self.assertFalse(sr._is_generated_meta_text("a normal sentence"))
 
+    def test_extract_command_display(self):
+        raw = (
+            "<command-message>code-review</command-message>\n"
+            "<command-name>/code-review</command-name>\n"
+            "<command-args>--fix a500e37</command-args>"
+        )
+        self.assertEqual(sr._extract_command_display(raw), "/code-review --fix a500e37")
+        self.assertEqual(
+            sr._extract_command_display("<command-name>/clear</command-name>"),
+            "/clear",
+        )
+        self.assertIsNone(sr._extract_command_display("plain user text"))
+
 
 class ClaudeParseTests(unittest.TestCase):
     def test_basic_chain(self):
@@ -136,6 +149,181 @@ class ClaudeParseTests(unittest.TestCase):
         self.assertEqual(result["last_assistant_action"], "Sure, editing now")
         # Thinking blocks must never leak into the inert payload.
         self.assertNotIn("secret private reasoning", json.dumps(result))
+
+    def test_title_prefers_custom_then_ai_then_last_prompt(self):
+        """Claude Code resume list: customTitle > aiTitle > lastPrompt."""
+        base = _claude_records("first user message")
+        # Leaf-chain-only fallback would see the first user text; named/ persisted
+        # title records must win instead.
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "named.jsonl"
+            _write_jsonl(
+                path,
+                base
+                + [
+                    {"type": "last-prompt", "lastPrompt": "later prompt", "sessionId": "s"},
+                    {"type": "ai-title", "aiTitle": "ai-slug", "sessionId": "s"},
+                    {"type": "custom-title", "customTitle": "my-name", "sessionId": "s"},
+                ],
+            )
+            self.assertEqual(sr.read_claude_session(path)["title"], "my-name")
+
+            path = Path(tmp) / "ai.jsonl"
+            _write_jsonl(
+                path,
+                base
+                + [
+                    {"type": "last-prompt", "lastPrompt": "later prompt", "sessionId": "s"},
+                    {"type": "ai-title", "aiTitle": "ai-slug", "sessionId": "s"},
+                ],
+            )
+            self.assertEqual(sr.read_claude_session(path)["title"], "ai-slug")
+
+            path = Path(tmp) / "last.jsonl"
+            _write_jsonl(
+                path,
+                base + [{"type": "last-prompt", "lastPrompt": "later prompt", "sessionId": "s"}],
+            )
+            self.assertEqual(sr.read_claude_session(path)["title"], "later prompt")
+
+    def test_title_from_last_prompt_when_leaf_chain_drops_first_user(self):
+        """Broken parent links must not yield (untitled) if last-prompt exists."""
+        records = [
+            {
+                "type": "user",
+                "uuid": "orphan-user",
+                "parentUuid": None,
+                "timestamp": "2026-07-20T10:00:00Z",
+                "cwd": FAKE_CWD,
+                "message": {
+                    "role": "user",
+                    "content": "Resize emoji cache thumbs to 100x100",
+                },
+            },
+            # mid-chain records whose parent is missing from the file → leaf
+            # walk never reaches orphan-user; title must still resolve.
+            {
+                "type": "assistant",
+                "uuid": "a-mid",
+                "parentUuid": "missing-parent",
+                "timestamp": "2026-07-20T10:01:00Z",
+                "cwd": FAKE_CWD,
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "ok"}],
+                },
+            },
+            {
+                "type": "user",
+                "uuid": "u-tool",
+                "parentUuid": "a-mid",
+                "timestamp": "2026-07-20T10:01:01Z",
+                "cwd": FAKE_CWD,
+                "message": {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "t1",
+                            "content": "ok",
+                        }
+                    ],
+                },
+            },
+            {
+                "type": "last-prompt",
+                "lastPrompt": "Resize emoji cache thumbs to 100x100",
+                "sessionId": "s",
+            },
+        ]
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "broken.jsonl"
+            _write_jsonl(path, records)
+            result = sr.read_claude_session(path)
+        self.assertEqual(result["title"], "Resize emoji cache thumbs to 100x100")
+
+    def test_title_from_command_xml_when_last_prompt_empty(self):
+        records = [
+            {
+                "type": "user",
+                "uuid": "u1",
+                "parentUuid": None,
+                "timestamp": "2026-07-20T10:00:00Z",
+                "cwd": FAKE_CWD,
+                "message": {
+                    "role": "user",
+                    "content": (
+                        "<command-message>clear</command-message>\n"
+                        "<command-name>/clear</command-name>\n"
+                        "<command-args></command-args>"
+                    ),
+                },
+            },
+            {
+                "type": "last-prompt",
+                "lastPrompt": None,
+                "sessionId": "s",
+            },
+        ]
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "cmd.jsonl"
+            _write_jsonl(path, records)
+            result = sr.read_claude_session(path)
+        self.assertEqual(result["title"], "/clear")
+
+    def test_title_ignores_sidechain_user_records(self):
+        """A sub-agent's internal prompt (isSidechain) must not become the title."""
+        records = [
+            {
+                "type": "user",
+                "uuid": "u1",
+                "parentUuid": None,
+                "timestamp": "2026-07-20T10:00:00Z",
+                "cwd": FAKE_CWD,
+                "message": {"role": "user", "content": "Fix the login bug in auth.py"},
+            },
+            {
+                "type": "assistant",
+                "uuid": "a1",
+                "parentUuid": "u1",
+                "timestamp": "2026-07-20T10:00:05Z",
+                "cwd": FAKE_CWD,
+                "message": {"role": "assistant", "content": [{"type": "text", "text": "on it"}]},
+            },
+            # Task sub-agent record, appended later; must be skipped for the title.
+            {
+                "type": "user",
+                "uuid": "s1",
+                "parentUuid": None,
+                "isSidechain": True,
+                "timestamp": "2026-07-20T10:01:00Z",
+                "cwd": FAKE_CWD,
+                "message": {"role": "user", "content": "You are a search agent. Grep for TODOs."},
+            },
+        ]
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "side.jsonl"
+            _write_jsonl(path, records)
+            result = sr.read_claude_session(path)
+        self.assertEqual(result["title"], "Fix the login bug in auth.py")
+
+    def test_title_keeps_explicit_title_starting_with_angle_bracket(self):
+        """`_is_generated_meta_text` must not drop a real custom title like `<wip> auth`."""
+        base = _claude_records("do the thing")
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "named.jsonl"
+            _write_jsonl(
+                path,
+                base + [{"type": "custom-title", "customTitle": "<wip> auth", "sessionId": "s"}],
+            )
+            self.assertEqual(sr.read_claude_session(path)["title"], "<wip> auth")
+
+            path = Path(tmp) / "prompt.jsonl"
+            _write_jsonl(
+                path,
+                base + [{"type": "last-prompt", "lastPrompt": "<div> is not rendering", "sessionId": "s"}],
+            )
+            self.assertEqual(sr.read_claude_session(path)["title"], "<div> is not rendering")
 
     def test_malformed_records_warned(self):
         with TemporaryDirectory() as tmp:

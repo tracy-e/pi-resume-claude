@@ -35,6 +35,13 @@ CODEX_ROLLOUT_RE = re.compile(
 )
 GENERATED_META_RE = re.compile(r"^\s*<[a-z][A-Za-z0-9_.:-]*(?:\s|/?>)")
 INTERRUPTED_RE = re.compile(r"^\s*\[Request interrupted by user", re.IGNORECASE)
+# Claude Code slash-command wrappers; the resume UI shows "/cmd args", not the XML.
+COMMAND_NAME_RE = re.compile(
+    r"<command-name>\s*([^<]+?)\s*</command-name>", re.IGNORECASE | re.DOTALL
+)
+COMMAND_ARGS_RE = re.compile(
+    r"<command-args>\s*([^<]*?)\s*</command-args>", re.IGNORECASE | re.DOTALL
+)
 CURSOR_SKIPPED_ROLES = {
     "system",
     "developer",
@@ -64,6 +71,10 @@ CLAUDE_KNOWN_TYPES = {
     "context-collapse-commit",
     "context-collapse-snapshot",
 }
+# Record flags that mark a Claude message as non-conversational (skipped when
+# rendering turns and when picking a title). Sidechain is added on top where a
+# sub-agent's own prompt must also be excluded.
+CLAUDE_META_FLAGS = ("isMeta", "isCompactSummary", "isVirtual", "isVisibleInTranscriptOnly")
 CODEX_SAFE_TOP_LEVEL = {
     "session_meta",
     "response_item",
@@ -637,10 +648,7 @@ def _render_claude_record(
 ) -> dict[str, Any] | None:
     if record.get("type") not in {"user", "assistant"}:
         return None
-    if any(
-        record.get(flag)
-        for flag in ("isMeta", "isCompactSummary", "isVirtual", "isVisibleInTranscriptOnly")
-    ):
+    if any(record.get(flag) for flag in CLAUDE_META_FLAGS):
         return None
     message = record.get("message")
     if not isinstance(message, dict):
@@ -692,21 +700,81 @@ def _render_claude_record(
     return _turn(role, text=text, tool_calls=tool_calls, tool_results=tool_results)
 
 
+def _extract_command_display(text: str) -> str | None:
+    """Turn Claude slash-command XML into the UI form `/name args`."""
+    match = COMMAND_NAME_RE.search(text)
+    if not match:
+        return None
+    name = " ".join(match.group(1).split())
+    if not name:
+        return None
+    args_match = COMMAND_ARGS_RE.search(text)
+    args = " ".join(args_match.group(1).split()) if args_match else ""
+    # name and args are already whitespace-collapsed, so no trailing strip needed.
+    return f"{name} {args}" if args else name
+
+
+def _claude_user_display_text(content: Any) -> str | None:
+    """Best-effort display text from a user message content payload."""
+    # _blocks() normalizes a bare string into a single text block, so this one
+    # loop handles both str and structured content.
+    parts = [
+        text
+        for block in _blocks(content)
+        if block.get("type") in {"text", "input_text", "output_text"}
+        and isinstance(text := block.get("text"), str)
+        and text.strip()
+    ]
+    raw = "\n".join(parts)
+    if not raw.strip():
+        return None
+    command = _extract_command_display(raw)
+    if command:
+        return command
+    if _is_generated_meta_text(raw):
+        return None
+    return raw
+
+
 def _claude_title(records: list[dict[str, Any]], turns: list[dict[str, Any]]) -> str | None:
+    # Match Claude Code's resume list: named title → AI title → last user prompt
+    # (stored as last-prompt) → summary → last recoverable user text.
+    # last-prompt / user text must be read from *all* records: the leaf chain can
+    # be truncated when parents are missing, which used to yield "(untitled)".
     for record_type, field in (
         ("custom-title", "customTitle"),
         ("ai-title", "aiTitle"),
+        ("last-prompt", "lastPrompt"),
         ("summary", "summary"),
     ):
         values = [
-            record.get(field)
+            value
             for record in records
-            if record.get("type") == record_type and isinstance(record.get(field), str)
+            if record.get("type") == record_type
+            and isinstance(value := record.get(field), str)
+            and value.strip()
         ]
         if values:
             return _one_line(values[-1], 200)
+    # Newest user text first (mirrors last-prompt); also skips pre-compaction
+    # history when a later real prompt exists after a compact boundary.
+    for record in reversed(records):
+        if record.get("type") != "user":
+            continue
+        if any(record.get(flag) for flag in (*CLAUDE_META_FLAGS, "isSidechain")):
+            continue
+        message = record.get("message")
+        if not isinstance(message, dict):
+            continue
+        text = _claude_user_display_text(message.get("content"))
+        if text:
+            return _one_line(text, 200)
     return next(
-        (_one_line(turn["text"], 200) for turn in turns if turn["role"] == "user" and turn["text"]),
+        (
+            _one_line(turn["text"], 200)
+            for turn in reversed(turns)
+            if turn["role"] == "user" and turn["text"]
+        ),
         None,
     )
 

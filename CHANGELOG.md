@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.1.4
+
+### UI
+- Session picker uses a fixed-height `SelectList` (10 visible rows) so long
+  lists scroll in place instead of expanding the TUI and jumping to the bottom.
+
+### Fixed
+- Session titles now follow Claude Code's resume list: `customTitle` → `aiTitle`
+  → `lastPrompt` → summary → last recoverable user text (including slash-command
+  XML → `/cmd args`). Broken parent chains no longer collapse to `(untitled)`.
+
 ## 0.1.3
 
 ### Extension

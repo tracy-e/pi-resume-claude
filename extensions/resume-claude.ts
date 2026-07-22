@@ -19,6 +19,8 @@ import { existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import { DynamicBorder, getSelectListTheme, keyHint, rawKeyHint } from "@earendil-works/pi-coding-agent";
+import { Container, type SelectItem, SelectList, Text } from "@earendil-works/pi-tui";
 
 const PACKAGE_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const SKILL_DIR = join(PACKAGE_ROOT, "skills", "resume-claude");
@@ -248,6 +250,10 @@ function buildHandoffPrompt(session: ShowResult): string {
 		.join("\n");
 }
 
+// Cap the picker so a long session list scrolls inside a fixed viewport
+// instead of growing the whole TUI and snapping the terminal to the bottom.
+const PICKER_MAX_VISIBLE = 10;
+
 async function pickSession(
 	ctx: ExtensionCommandContext,
 	sessions: SessionSummary[],
@@ -257,6 +263,42 @@ async function pickSession(
 	if (sessions.length === 1) return sessions[0];
 	// No UI: force an explicit id rather than silently pick one.
 	if (!ctx.hasUI) return undefined;
+
+	// TUI: SelectList keeps a fixed maxVisible window and scrolls within it.
+	// RPC falls back to ctx.ui.select (custom() is TUI-only).
+	if (ctx.mode === "tui") {
+		const items: SelectItem[] = sessions.map((s) => ({
+			value: s.session_id,
+			label: formatSessionLabel(s),
+		}));
+		const selectedId = await ctx.ui.custom<string | null>((tui, theme, _kb, done) => {
+			const container = new Container();
+			container.addChild(new DynamicBorder((str) => theme.fg("accent", str)));
+			container.addChild(new Text(theme.fg("accent", theme.bold(title)), 1, 0));
+
+			// SelectList clamps maxVisible to the item count internally.
+			const selectList = new SelectList(items, PICKER_MAX_VISIBLE, getSelectListTheme());
+			selectList.onSelect = (item) => done(item.value);
+			selectList.onCancel = () => done(null);
+			container.addChild(selectList);
+
+			const hint =
+				`${rawKeyHint("↑↓", "navigate")}  ` +
+				`${keyHint("tui.select.confirm", "select")}  ${keyHint("tui.select.cancel", "cancel")}`;
+			container.addChild(new Text(hint, 1, 0));
+			container.addChild(new DynamicBorder((str) => theme.fg("accent", str)));
+
+			return {
+				render: (width) => container.render(width),
+				invalidate: () => container.invalidate(),
+				handleInput: (data) => {
+					selectList.handleInput(data);
+					tui.requestRender();
+				},
+			};
+		});
+		return selectedId ? sessions.find((s) => s.session_id === selectedId) : undefined;
+	}
 
 	const labels = sessions.map(formatSessionLabel);
 	const selected = await ctx.ui.select(title, labels);
