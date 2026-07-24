@@ -43,10 +43,13 @@ Requirements:
 
 | Form | Behavior |
 | --- | --- |
-| no args | List Claude sessions for the current cwd and pick one (prints ids when headless) |
-| `latest` | Resume the newest session (aliases: `continue`, `-c`) |
-| session id | Resolve by native UUID |
-| free text | Match against titles; open a picker when ambiguous |
+| no args | Open a searchable picker over every session for this cwd and its subdirectories — type to filter live |
+| free text | The same picker, pre-filtered by those words (editable, so a typo just narrows to nothing instead of failing) |
+| `latest` | Resume the newest session directly, no picker (aliases: `continue`, `-c`) |
+| session id | Resume that session directly by native UUID |
+
+Filtering matches the title and the session id. Headless (no TUI) has no picker:
+it prints the session ids so you can resume by id.
 
 The command will:
 
@@ -77,7 +80,7 @@ extensions/resume-claude.ts          # /resume-claude command
 skills/resume-claude/
   SKILL.md
   references/CORE.md                 # handoff rules
-  scripts/session_reader.py          # Claude/Codex/Cursor session reader
+  scripts/session_reader.py          # Claude Code session reader
 ```
 
 `session_reader.py` is adapted from Grok Build's bundled skill reader and keeps

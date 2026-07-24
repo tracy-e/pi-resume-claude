@@ -8,10 +8,11 @@
  *   4. Inject a handoff prompt so the agent can continue safely
  *
  * Usage:
- *   /resume-claude            list sessions and pick (prints ids when headless)
- *   /resume-claude latest     resume the newest session (aliases: continue, -c)
- *   /resume-claude <session-id>
- *   /resume-claude <words from title>
+ *   /resume-claude            open a searchable session picker (type to filter live)
+ *   /resume-claude <words>    open the picker pre-filtered by those words
+ *   /resume-claude latest     resume the newest session directly (aliases: continue, -c)
+ *   /resume-claude <session-id>   resume that session directly
+ * Headless has no picker: it prints ids to resume by id.
  */
 
 import { spawn, spawnSync } from "node:child_process";
@@ -20,13 +21,20 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { DynamicBorder, getSelectListTheme, keyHint, rawKeyHint } from "@earendil-works/pi-coding-agent";
-import { Container, type SelectItem, SelectList, Text } from "@earendil-works/pi-tui";
+import { fuzzyFilter, Input, type SelectItem, SelectList, Text } from "@earendil-works/pi-tui";
 
 const PACKAGE_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const SKILL_DIR = join(PACKAGE_ROOT, "skills", "resume-claude");
 const READER = join(SKILL_DIR, "scripts", "session_reader.py");
 const CORE_MD = join(SKILL_DIR, "references", "CORE.md");
 const TOOL = "claude";
+// Mirrors UUID_RE / _LATEST_ALIASES in scripts/session_reader.py — keep both
+// sides in sync when either changes.
+const UUID_RE = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
+// "latest" plus Claude Code's own "continue most recent" spellings. One
+// definition for both uses: normalizing a ref before it reaches the reader, and
+// deciding a ref resumes directly instead of opening the picker.
+const LATEST_RE = /^(--continue|continue|-c|latest)$/i;
 
 type SessionSummary = {
 	session_id: string;
@@ -83,9 +91,27 @@ function runReader(python: string, args: string[]): Promise<{ status: number; st
 	});
 }
 
-// Mirror the reader's free-text match: lower-cased, whitespace-normalized.
-function normalizeForMatch(text: string): string {
-	return text.toLowerCase().replace(/\s+/g, " ").trim();
+// Structured error payload the reader emits on stdout under --json:
+//   ambiguous: { error: "ambiguous_reference", message, matches: [<summary>, ...] }
+//   other:     { error: "reader_error", message }
+// Surfacing `.message` keeps a pretty-printed JSON blob from ever reaching the
+// user as the raw error text.
+type ReaderErrorPayload = Omit<ReaderErr, "ok">;
+function parseReaderError(stdout: string): ReaderErrorPayload | undefined {
+	let data: unknown;
+	try {
+		data = parseJsonLoose(stdout);
+	} catch {
+		return undefined;
+	}
+	if (!data || typeof data !== "object") return undefined;
+	const obj = data as Record<string, unknown>;
+	if (typeof obj.error !== "string") return undefined;
+	const message = typeof obj.message === "string" ? obj.message : obj.error;
+	if (obj.error === "ambiguous_reference" && Array.isArray(obj.matches)) {
+		return { message, matches: obj.matches as SessionSummary[] };
+	}
+	return { message };
 }
 
 function parseJsonLoose(text: string): unknown {
@@ -107,7 +133,10 @@ function parseJsonLoose(text: string): unknown {
 async function listSessions(python: string, cwd: string): Promise<ReaderResult<SessionSummary[]>> {
 	const r = await runReader(python, [TOOL, "list", "--cwd", cwd, "--json"]);
 	if (r.status !== 0) {
-		return { ok: false, message: (r.stderr || r.stdout || "list failed").trim() };
+		// Consume the reader's structured JSON error the same way showSession does,
+		// so a caught ReaderError never surfaces as a raw pretty-printed blob.
+		const message = parseReaderError(r.stdout)?.message ?? (r.stderr || r.stdout || "list failed").trim();
+		return { ok: false, message };
 	}
 	try {
 		const data = parseJsonLoose(r.stdout) as ListResult;
@@ -121,23 +150,19 @@ async function showSession(python: string, cwd: string, ref: string): Promise<Re
 	// Map Claude's "continue most recent" spellings onto the reader's `latest` here
 	// so a leading-dash ref (-c) never reaches the reader's argument parser, where
 	// argparse would treat it as an unknown option (portability across Python).
-	const resolved = /^(--continue|continue|-c)$/i.test(ref.trim()) ? "latest" : ref;
+	// Mapping "latest" onto itself is a no-op, so the shared regex fits as-is.
+	const resolved = LATEST_RE.test(ref.trim()) ? "latest" : ref;
 	const r = await runReader(python, [TOOL, "show", resolved, "--cwd", cwd, "--json"]);
 	if (r.status !== 0) {
-		const message = (r.stderr || r.stdout || "show failed").trim();
-		// Ambiguous free-text matches are printed to stderr; recover via list filter.
-		if (/matched \d+ sessions/i.test(message)) {
-			const listed = await listSessions(python, cwd);
-			if (listed.ok) {
-				const query = normalizeForMatch(ref);
-				const matches = listed.data.filter((s) =>
-					normalizeForMatch(s.title || "").includes(query),
-				);
-				if (matches.length > 1) {
-					return { ok: false, message, matches };
-				}
-			}
+		// The reader emits structured errors on stdout under --json. Ambiguous
+		// free-text carries candidate summaries (route straight to the picker);
+		// any other reader error carries a human message. Fall back to raw
+		// stderr/stdout only for non-JSON failures (e.g. argparse usage errors).
+		const parsed = parseReaderError(r.stdout);
+		if (parsed?.matches && parsed.matches.length > 1) {
+			return { ok: false, message: parsed.message, matches: parsed.matches };
 		}
+		const message = parsed?.message ?? (r.stderr || r.stdout || "show failed").trim();
 		return { ok: false, message };
 	}
 	try {
@@ -254,45 +279,101 @@ function buildHandoffPrompt(session: ShowResult): string {
 // instead of growing the whole TUI and snapping the terminal to the bottom.
 const PICKER_MAX_VISIBLE = 10;
 
+// Fuzzy-filter sessions by their (cleaned) title, mirroring Claude's live
+// resume search: `repair` still matches `qwen-repair-lora`.
+function filterSessions(sessions: SessionSummary[], query: string): SessionSummary[] {
+	const q = query.trim();
+	// Search the id too: every row shows a short id, and it is the natural key
+	// when titles collide or are "(untitled)".
+	return q ? fuzzyFilter(sessions, q, (s) => `${cleanTitle(s)} ${s.session_id}`) : sessions;
+}
+
 async function pickSession(
 	ctx: ExtensionCommandContext,
 	sessions: SessionSummary[],
 	title: string,
+	initialFilter = "",
 ): Promise<SessionSummary | undefined> {
 	if (sessions.length === 0) return undefined;
-	if (sessions.length === 1) return sessions[0];
+	// A lone session with no prefill is unambiguous; skip the picker.
+	if (sessions.length === 1 && !initialFilter) return sessions[0];
 	// No UI: force an explicit id rather than silently pick one.
 	if (!ctx.hasUI) return undefined;
 
-	// TUI: SelectList keeps a fixed maxVisible window and scrolls within it.
+	// TUI: a search Input on top of the SelectList, filtered live as you type.
 	// RPC falls back to ctx.ui.select (custom() is TUI-only).
 	if (ctx.mode === "tui") {
-		const items: SelectItem[] = sessions.map((s) => ({
-			value: s.session_id,
-			label: formatSessionLabel(s),
-		}));
-		const selectedId = await ctx.ui.custom<string | null>((tui, theme, _kb, done) => {
-			const container = new Container();
-			container.addChild(new DynamicBorder((str) => theme.fg("accent", str)));
-			container.addChild(new Text(theme.fg("accent", theme.bold(title)), 1, 0));
+		const selectedId = await ctx.ui.custom<string | null>((tui, theme, kb, done) => {
+			const input = new Input();
+			input.focused = true;
+			// Feed the prefill through handleInput (not setValue) so the cursor lands
+			// at the end -- setValue leaves it at 0, which would prepend later typing.
+			if (initialFilter) input.handleInput(initialFilter);
 
-			// SelectList clamps maxVisible to the item count internally.
-			const selectList = new SelectList(items, PICKER_MAX_VISIBLE, getSelectListTheme());
-			selectList.onSelect = (item) => done(item.value);
-			selectList.onCancel = () => done(null);
-			container.addChild(selectList);
+			const borderTop = new DynamicBorder((str) => theme.fg("accent", str));
+			const borderBottom = new DynamicBorder((str) => theme.fg("accent", str));
+			const titleText = new Text(theme.fg("accent", theme.bold(title)), 1, 0);
+			const hintText = new Text(
+				`${rawKeyHint("↑↓", "navigate")}  ${keyHint("tui.select.confirm", "select")}  ` +
+					`${keyHint("tui.select.cancel", "cancel")}  ${rawKeyHint("type", "filter")}`,
+				1,
+				0,
+			);
 
-			const hint =
-				`${rawKeyHint("↑↓", "navigate")}  ` +
-				`${keyHint("tui.select.confirm", "select")}  ${keyHint("tui.select.cancel", "cancel")}`;
-			container.addChild(new Text(hint, 1, 0));
-			container.addChild(new DynamicBorder((str) => theme.fg("accent", str)));
+			// SelectList's built-in empty copy says "No matching commands", which is
+			// command-palette wording; render our own row instead.
+			const emptyText = new Text("  No matching sessions", 1, 0);
+
+			// SelectList has no setItems, so a filter change rebuilds it. Selection
+			// resets to the top, which matches how live-search pickers behave.
+			let selectList: SelectList;
+			let noMatches = false;
+			const rebuild = () => {
+				const filtered = filterSessions(sessions, input.getValue());
+				noMatches = filtered.length === 0;
+				const items: SelectItem[] = filtered.map((s) => ({
+					value: s.session_id,
+					label: formatSessionLabel(s),
+				}));
+				selectList = new SelectList(items, PICKER_MAX_VISIBLE, getSelectListTheme());
+				selectList.onSelect = (item) => done(item.value);
+				selectList.onCancel = () => done(null);
+			};
+			rebuild();
 
 			return {
-				render: (width) => container.render(width),
-				invalidate: () => container.invalidate(),
+				render: (width) => [
+					...borderTop.render(width),
+					...titleText.render(width),
+					"",
+					...input.render(width),
+					"",
+					...(noMatches ? emptyText.render(width) : selectList.render(width)),
+					...hintText.render(width),
+					...borderBottom.render(width),
+				],
+				invalidate: () => {
+					input.invalidate();
+					selectList.invalidate();
+				},
 				handleInput: (data) => {
-					selectList.handleInput(data);
+					// Route explicitly by keybinding: navigation/confirm/cancel drive the
+					// list, everything else edits the search box. (Relying on "Input no-ops
+					// on enter/esc" would silently break if Input ever grew a side effect.)
+					const listKey =
+						kb.matches(data, "tui.select.up") ||
+						kb.matches(data, "tui.select.down") ||
+						kb.matches(data, "tui.select.pageUp") ||
+						kb.matches(data, "tui.select.pageDown") ||
+						kb.matches(data, "tui.select.confirm") ||
+						kb.matches(data, "tui.select.cancel");
+					if (listKey) {
+						selectList.handleInput(data);
+					} else {
+						const before = input.getValue();
+						input.handleInput(data);
+						if (input.getValue() !== before) rebuild();
+					}
 					tui.requestRender();
 				},
 			};
@@ -300,11 +381,16 @@ async function pickSession(
 		return selectedId ? sessions.find((s) => s.session_id === selectedId) : undefined;
 	}
 
-	const labels = sessions.map(formatSessionLabel);
+	// RPC: no live input, so pre-filter by the initial query and plain-select.
+	// The client fuzzy filter can diverge from the reader's server-side match
+	// (casefold vs toLowerCase), so never narrow a real candidate set to empty.
+	let pool = filterSessions(sessions, initialFilter);
+	if (pool.length === 0) pool = sessions;
+	const labels = pool.map(formatSessionLabel);
 	const selected = await ctx.ui.select(title, labels);
 	if (!selected) return undefined;
 	const index = labels.indexOf(selected);
-	return index >= 0 ? sessions[index] : undefined;
+	return index >= 0 ? pool[index] : undefined;
 }
 
 // Headless multi-match needs an explicit id; print the ids so one is pickable.
@@ -315,6 +401,55 @@ function notifyNoSelection(ctx: ExtensionCommandContext, candidates: SessionSumm
 	} else {
 		ctx.ui.notify("Cancelled", "info");
 	}
+}
+
+// Open the picker over `candidates` and read whichever session is chosen.
+// Returns undefined after notifying the user (cancel / headless / read error).
+async function pickAndShow(
+	python: string,
+	ctx: ExtensionCommandContext,
+	cwd: string,
+	candidates: SessionSummary[],
+	title: string,
+	initialFilter: string,
+): Promise<ShowResult | undefined> {
+	const picked = await pickSession(ctx, candidates, title, initialFilter);
+	if (!picked) {
+		notifyNoSelection(ctx, candidates);
+		return undefined;
+	}
+	// Resume by path, not id: the reader resolves a path directly, while an id
+	// would send it back through a full discovery scan we just paid for.
+	const shown = await showSession(python, cwd, picked.path || picked.session_id);
+	if (!shown.ok) {
+		ctx.ui.notify(shown.message, "error");
+		return undefined;
+	}
+	return shown.data;
+}
+
+// List every session, open the picker (searchable in TUI, pre-filtered by
+// `initialFilter`), and resolve the choice. Returns undefined when it has
+// already notified the user (no sessions / headless multi-match / cancel / read
+// error), so the caller can just return.
+async function pickFromAll(
+	python: string,
+	ctx: ExtensionCommandContext,
+	cwd: string,
+	initialFilter: string,
+): Promise<ShowResult | undefined> {
+	const listed = await listSessions(python, cwd);
+	if (!listed.ok) {
+		ctx.ui.notify(listed.message, "error");
+		return undefined;
+	}
+	if (listed.data.length === 0) {
+		ctx.ui.notify(`No Claude Code sessions found for ${cwd}`, "warning");
+		return undefined;
+	}
+	// Headless with several matches falls through to pickSession, which declines
+	// to pick without a UI; notifyNoSelection then prints the ids to resume by.
+	return pickAndShow(python, ctx, cwd, listed.data, "Resume Claude Code session", initialFilter);
 }
 
 async function resumeClaude(args: string, ctx: ExtensionCommandContext, pi: ExtensionAPI): Promise<void> {
@@ -332,55 +467,31 @@ async function resumeClaude(args: string, ctx: ExtensionCommandContext, pi: Exte
 	const cwd = ctx.cwd;
 	const ref = args.trim();
 
+	// A direct ref (latest / native id) resumes instantly. Empty or free-text refs
+	// open the searchable picker over *all* sessions in TUI, pre-filtered by the ref
+	// so you refine live like Claude's /resume -- a typo shows an adjustable list
+	// instead of a hard "no session matched" error. Headless/RPC keeps the
+	// reader-driven resolution (id listing / server-side match).
+	const directRef = LATEST_RE.test(ref) || UUID_RE.test(ref);
+	const usePicker = !directRef && (!ref || (ctx.hasUI && ctx.mode === "tui"));
+
 	let session: ShowResult | undefined;
 
-	if (!ref) {
-		const listed = await listSessions(python, cwd);
-		if (!listed.ok) {
-			ctx.ui.notify(listed.message, "error");
-			return;
-		}
-		if (listed.data.length === 0) {
-			ctx.ui.notify(`No Claude Code sessions found for ${cwd}`, "warning");
-			return;
-		}
-		// No picker with several matches: print ids so the user can resume by id.
-		if (!ctx.hasUI && listed.data.length > 1) {
-			ctx.ui.notify(renderSessionList(listed.data, cwd), "info");
-			return;
-		}
-		const picked = await pickSession(ctx, listed.data, "Resume Claude Code session");
-		if (!picked) {
-			notifyNoSelection(ctx, listed.data);
-			return;
-		}
-		const shown = await showSession(python, cwd, picked.session_id);
-		if (!shown.ok) {
-			ctx.ui.notify(shown.message, "error");
-			return;
-		}
-		session = shown.data;
+	if (usePicker) {
+		session = await pickFromAll(python, ctx, cwd, ref);
+		if (!session) return;
 	} else {
 		const shown = await showSession(python, cwd, ref);
-		if (!shown.ok) {
-			if (shown.matches && shown.matches.length > 0) {
-				const picked = await pickSession(ctx, shown.matches, `Multiple matches for "${ref}"`);
-				if (!picked) {
-					notifyNoSelection(ctx, shown.matches);
-					return;
-				}
-				const again = await showSession(python, cwd, picked.session_id);
-				if (!again.ok) {
-					ctx.ui.notify(again.message, "error");
-					return;
-				}
-				session = again.data;
-			} else {
-				ctx.ui.notify(shown.message, "error");
-				return;
-			}
-		} else {
+		if (shown.ok) {
 			session = shown.data;
+		} else if (shown.matches?.length) {
+			// Reader-side free-text match was ambiguous: let the user disambiguate.
+			// (A direct ref never lands here -- latest / a native id cannot be ambiguous.)
+			session = await pickAndShow(python, ctx, cwd, shown.matches, `Multiple matches for "${ref}"`, ref);
+			if (!session) return;
+		} else {
+			ctx.ui.notify(shown.message, "error");
+			return;
 		}
 	}
 
