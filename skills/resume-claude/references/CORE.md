@@ -1,8 +1,8 @@
 # Resume a foreign coding-agent session
 
-The wrapper sets `TOOL` to `claude`, `codex`, or `cursor` and sets
-`SHARED_DIR` to the directory containing this file's parent `scripts/` sibling
-layout. Prefer the package extension command when available:
+The wrapper sets `TOOL` to `claude` and sets `SHARED_DIR` to the directory
+containing this file's parent `scripts/` sibling layout. Prefer the package
+extension command when available:
 
 ```text
 /resume-claude [words | session id | latest]
@@ -53,13 +53,17 @@ Apply these argument rules:
 python3 "${SKILL_DIR}/scripts/session_reader.py" "$TOOL" list --cwd "$PWD" --json
 ```
 
-Supported optional flags are `--within-min N` and `--max-tool-chars N`. Use
-`python` or `py -3` only when `python3` is unavailable.
+Supported optional flags are `--within-min N`, `--max-tool-chars N` (caps each
+recovered tool input/output), `--max-text-chars N` (caps each recovered
+message's text; default 2000), and `--limit N` (list only the N most-recent
+sessions; default `0` = no cap). Truncation is surfaced as a
+`message_text_truncated` warning. `list` covers the cwd and its subdirectories,
+newest first. Use `python` or `py -3` only when `python3` is unavailable.
 
 The approved interface is:
 
 ```text
-session_reader.py <claude|codex|cursor> <list|show> [ref] [--cwd DIR] [--within-min N] [--json] [--max-tool-chars N]
+session_reader.py claude <list|show> [ref] [--cwd DIR] [--within-min N] [--json] [--max-tool-chars N] [--max-text-chars N] [--limit N]
 ```
 
 ## Build the handoff

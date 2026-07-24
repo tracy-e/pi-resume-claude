@@ -386,6 +386,37 @@ class ClaudeParseTests(unittest.TestCase):
         self.assertEqual(result["last_user_request"], "new task")
         self.assertNotIn("old stuff", json.dumps(result))
 
+    def test_message_text_truncated_with_warning(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "s.jsonl"
+            _write_jsonl(path, _claude_records("x" * 5000))
+            result = sr.read_claude_session(path, max_text_chars=100)
+        user_turn = next(t for t in result["turns"] if t["role"] == "user" and t["text"])
+        self.assertIn("truncated", user_turn["text"])
+        # Stored text (content + marker) must respect the cap, not overshoot it.
+        self.assertLessEqual(len(user_turn["text"]), 100)
+        self.assertIn(
+            "message_text_truncated", [w["code"] for w in result["warnings"]]
+        )
+
+    def test_message_text_tiny_cap_still_respects_bound(self):
+        # A cap smaller than the truncation marker must hard-cut, never overshoot.
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "s.jsonl"
+            _write_jsonl(path, _claude_records("x" * 5000))
+            result = sr.read_claude_session(path, max_text_chars=5)
+        for turn in result["turns"]:
+            self.assertLessEqual(len(turn["text"]), 5)
+
+    def test_message_text_untouched_under_cap(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "s.jsonl"
+            _write_jsonl(path, _claude_records("Short prompt"))
+            result = sr.read_claude_session(path)  # default cap far exceeds text
+        self.assertNotIn(
+            "message_text_truncated", [w["code"] for w in result["warnings"]]
+        )
+
 
 class DiscoverAndResolveTests(unittest.TestCase):
     def _build_store(self, tmp: str) -> None:
@@ -478,11 +509,10 @@ class DiscoverAndResolveTests(unittest.TestCase):
                 sessions = sr.discover_sessions("claude", FAKE_CWD)
         self.assertEqual([s["session_id"] for s in sessions], [uid])
 
-    def test_prefilter_keeps_own_dir_session_past_scan_bound(self):
-        # Regression: a leading-orphan chain longer than the bounded pre-filter
-        # scan must not veto a target-cwd leaf chain that lives in its own slug
-        # dir. The cheap "foreign" verdict is advisory there; the full parse's
-        # cwd check is authoritative.
+    def test_leading_foreign_cwd_records_do_not_veto_match(self):
+        # A session that opens with a run of foreign-cwd orphans before reaching
+        # the real target-cwd chain must still be discovered: the cwd check is
+        # "any record is within the target", not "the first/leaf record matches".
         uid = "44444444-4444-4444-8444-444444444444"
         records = [
             {
@@ -493,7 +523,7 @@ class DiscoverAndResolveTests(unittest.TestCase):
                 "cwd": "/some/other/place",
                 "message": {"role": "user", "content": [{"type": "text", "text": f"old {i}"}]},
             }
-            for i in range(sr._PREFILTER_MAX_CWD_RECORDS + 2)
+            for i in range(10)
         ]
         records += [
             {
@@ -522,6 +552,108 @@ class DiscoverAndResolveTests(unittest.TestCase):
             with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": tmp}):
                 sessions = sr.discover_sessions("claude", FAKE_CWD)
         self.assertEqual([s["session_id"] for s in sessions], [uid])
+
+    def test_discovers_subdirectory_sessions(self):
+        # Claude Code treats a session run in a subdirectory as part of the repo,
+        # so resuming from the root must surface it (its own slug dir is a
+        # descendant of the cwd's slug dir).
+        sub_cwd = FAKE_CWD + "/backend"
+        uid = "55555555-5555-4555-8555-555555555555"
+        with TemporaryDirectory() as tmp:
+            sub_dir = Path(tmp) / "projects" / sr.slugify(sub_cwd)
+            sub_dir.mkdir(parents=True)
+            _write_jsonl(sub_dir / f"{uid}.jsonl", _claude_records("backend work", cwd=sub_cwd))
+            with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": tmp}):
+                ids = [s["session_id"] for s in sr.discover_sessions("claude", FAKE_CWD)]
+        self.assertIn(uid, ids)
+
+    def test_discovers_ancestor_slug_session_that_entered_this_cwd(self):
+        # Launched at the monorepo root (so it lives under the *root* slug dir)
+        # and later cd'd into this package: resuming from the package must find it.
+        sub_cwd = FAKE_CWD + "/backend"
+        uid = "77777777-7777-4777-8777-777777777777"
+        records = _claude_records("root session that moved")
+        records[-1]["cwd"] = sub_cwd
+        with TemporaryDirectory() as tmp:
+            root_dir = Path(tmp) / "projects" / sr.slugify(FAKE_CWD)
+            root_dir.mkdir(parents=True)
+            _write_jsonl(root_dir / f"{uid}.jsonl", records)
+            with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": tmp}):
+                ids = [s["session_id"] for s in sr.discover_sessions("claude", sub_cwd)]
+        self.assertIn(uid, ids)
+
+    def test_pure_ancestor_session_does_not_leak_into_subdir(self):
+        # A root session that never entered the package must NOT show up there,
+        # even though the root slug dir is now scanned.
+        sub_cwd = FAKE_CWD + "/backend"
+        uid = "88888888-8888-4888-8888-888888888888"
+        with TemporaryDirectory() as tmp:
+            root_dir = Path(tmp) / "projects" / sr.slugify(FAKE_CWD)
+            root_dir.mkdir(parents=True)
+            _write_jsonl(root_dir / f"{uid}.jsonl", _claude_records("root only"))
+            with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": tmp}):
+                ids = [s["session_id"] for s in sr.discover_sessions("claude", sub_cwd)]
+        self.assertNotIn(uid, ids)
+
+    def test_own_dir_session_kept_when_light_window_truncated(self):
+        # The matching cwd sits in the unread middle: a "no match" verdict from a
+        # truncated light read must not drop an own-slug session.
+        uid = "99999999-9999-4999-8999-999999999999"
+        foreign = {
+            "type": "user",
+            "parentUuid": None,
+            "cwd": "/some/other/place",
+            "message": {"role": "user", "content": [{"type": "text", "text": "x" * 120}]},
+        }
+        records = []
+        for i in range(12):
+            record = dict(foreign, uuid=f"f{i}", timestamp=f"2026-07-20T08:{i:02d}:00Z")
+            if i == 6:  # only the middle record carries the matching cwd
+                record = dict(record, cwd=FAKE_CWD)
+            records.append(record)
+        with TemporaryDirectory() as tmp:
+            projects = Path(tmp) / "projects" / sr.slugify(FAKE_CWD)
+            projects.mkdir(parents=True)
+            _write_jsonl(projects / f"{uid}.jsonl", records)
+            # Shrink the light window so the middle really is skipped.
+            with (
+                mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": tmp}),
+                mock.patch.object(sr, "_LIGHT_HEAD_BYTES", 200),
+                mock.patch.object(sr, "_LIGHT_TAIL_BYTES", 200),
+            ):
+                ids = [s["session_id"] for s in sr.discover_sessions("claude", FAKE_CWD)]
+        self.assertIn(uid, ids)
+
+    def test_excludes_sibling_repo_sessions(self):
+        # A sibling repo's slug shares the cwd-slug prefix, so the cheap dir
+        # pre-select would let it in -- the content is-within check must reject it.
+        sibling_cwd = FAKE_CWD + "-other"
+        uid = "66666666-6666-4666-8666-666666666666"
+        with TemporaryDirectory() as tmp:
+            sib_dir = Path(tmp) / "projects" / sr.slugify(sibling_cwd)
+            sib_dir.mkdir(parents=True)
+            _write_jsonl(sib_dir / f"{uid}.jsonl", _claude_records("sibling", cwd=sibling_cwd))
+            with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": tmp}):
+                ids = [s["session_id"] for s in sr.discover_sessions("claude", FAKE_CWD)]
+        self.assertNotIn(uid, ids)
+
+    def test_limit_keeps_most_recent(self):
+        with TemporaryDirectory() as tmp:
+            projects = Path(tmp) / "projects" / sr.slugify(FAKE_CWD)
+            projects.mkdir(parents=True)
+            ids = []
+            for i in range(4):
+                uid = f"{i}{i}{i}{i}0000-0000-4000-8000-000000000000"
+                ids.append(uid)
+                path = projects / f"{uid}.jsonl"
+                _write_jsonl(path, _claude_records(f"session {i}"))
+                os.utime(path, (1_000_000 + i, 1_000_000 + i))  # i=3 is newest
+            with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": tmp}):
+                limited = sr.discover_sessions("claude", FAKE_CWD, limit=2)
+                unlimited = sr.discover_sessions("claude", FAKE_CWD)
+        self.assertEqual(len(unlimited), 4)
+        # Only the two most recent, newest first.
+        self.assertEqual([s["session_id"] for s in limited], [ids[3], ids[2]])
 
 
 class CliTests(unittest.TestCase):
@@ -552,16 +684,52 @@ class CliTests(unittest.TestCase):
                 self.assertEqual(code, 0)
                 self.assertEqual(json.loads(out)["session_id"], uid)
 
-    def test_cli_ambiguous_exits_two(self):
+    def _build_ambiguous_store(self, tmp: str) -> None:
+        projects = Path(tmp) / "projects" / sr.slugify(FAKE_CWD)
+        projects.mkdir(parents=True)
+        _write_jsonl(projects / "11111111-1111-4111-8111-111111111111.jsonl", _claude_records("Edge case"))
+        _write_jsonl(projects / "22222222-2222-4222-8222-222222222222.jsonl", _claude_records("Elder scroll"))
+
+    def test_cli_ambiguous_json_returns_structured_matches(self):
+        with TemporaryDirectory() as tmp:
+            self._build_ambiguous_store(tmp)
+            with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": tmp}):
+                code, out, err = self._run(["claude", "show", "e", "--cwd", FAKE_CWD, "--json"])
+        self.assertEqual(code, 2)
+        # Structured mode: machine-readable payload on stdout, nothing on stderr.
+        self.assertEqual(err, "")
+        payload = json.loads(out)
+        self.assertEqual(payload["error"], "ambiguous_reference")
+        self.assertEqual(payload["reference"], "e")
+        self.assertGreater(len(payload["matches"]), 1)
+        first = payload["matches"][0]
+        self.assertIn("session_id", first)
+        self.assertIn("title", first)
+
+    def test_cli_ambiguous_human_lists_matches_on_stderr(self):
+        with TemporaryDirectory() as tmp:
+            self._build_ambiguous_store(tmp)
+            with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": tmp}):
+                code, out, err = self._run(["claude", "show", "e", "--cwd", FAKE_CWD])
+        self.assertEqual(code, 2)
+        self.assertEqual(out, "")
+        self.assertIn("matched", err)
+
+    def test_cli_reader_error_json_is_structured(self):
+        # A non-ambiguous failure under --json must still be parseable JSON on
+        # stdout (not human text on stderr), so the extension never shows a raw
+        # blob as the error message.
         with TemporaryDirectory() as tmp:
             projects = Path(tmp) / "projects" / sr.slugify(FAKE_CWD)
             projects.mkdir(parents=True)
-            _write_jsonl(projects / "11111111-1111-4111-8111-111111111111.jsonl", _claude_records("Edge case"))
-            _write_jsonl(projects / "22222222-2222-4222-8222-222222222222.jsonl", _claude_records("Elder scroll"))
+            _write_jsonl(projects / "11111111-1111-4111-8111-111111111111.jsonl", _claude_records("Only one"))
             with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": tmp}):
-                code, _, err = self._run(["claude", "show", "e", "--cwd", FAKE_CWD, "--json"])
+                code, out, err = self._run(["claude", "show", "nomatch-zzz", "--cwd", FAKE_CWD, "--json"])
         self.assertEqual(code, 2)
-        self.assertIn("matched", err)
+        self.assertEqual(err, "")
+        payload = json.loads(out)
+        self.assertEqual(payload["error"], "reader_error")
+        self.assertIn("message", payload)
 
 
 if __name__ == "__main__":
