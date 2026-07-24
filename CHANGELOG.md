@@ -1,5 +1,42 @@
 # Changelog
 
+## 0.1.5
+
+### UI
+- The session picker is searchable: a filter input sits above the list and
+  narrows it live as you type (fuzzy, matching both the title and the session
+  id). `/resume-claude <words>` now opens that picker pre-filtered instead of
+  failing outright, so a typo is editable rather than fatal.
+
+### Performance
+- Discovery reads a bounded head/tail window of each transcript instead of
+  parsing it in full. On a 1.3 GB session store a listing went from ~6.7s to
+  ~0.8s.
+
+### Fixed
+- Sessions started in a subdirectory — or in a parent directory and later moved
+  into the current one — are now listed, matching `claude --resume`. Discovery
+  scans the cwd's own project slug plus descendant and ancestor slugs, and keeps
+  a session when any recorded cwd is inside the current directory.
+- Discovery no longer silently drops a session whose transcript is larger than
+  the head/tail window, or whose window holds a single oversized record.
+- The content-based cwd pre-filter is gone; it dropped legitimate sessions when
+  an early record carried a different cwd.
+
+### Reader
+- Failures are reported through a structured JSON error channel under `--json`
+  (`ambiguous_reference` carrying candidate summaries, `reader_error`
+  otherwise), so the extension routes an ambiguous reference straight to the
+  picker instead of scraping the message text.
+- `--max-text-chars` (default 2000) caps each recovered message's text, keeping
+  a handoff payload bounded on long sessions; truncation is surfaced as a
+  `message_text_truncated` warning.
+- `--limit N` lists only the N most-recent sessions (default `0`, no cap).
+
+### Removed
+- Dropped the unreachable Codex and Cursor reader paths (~1150 lines). The
+  package is Claude-only, matching its name and documentation.
+
 ## 0.1.4
 
 ### UI
