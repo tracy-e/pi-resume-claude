@@ -1,5 +1,44 @@
 # Changelog
 
+## 0.2.0
+
+### Added
+- `/resume-codex` resumes Codex sessions (CLI and the Codex desktop / VS Code
+  app) the same way `/resume-claude` handles Claude Code: discover for the
+  current cwd, pick interactively or by id/`latest`, then inject a bounded inert
+  handoff. Ships with the `resume-codex` skill.
+- `session_reader.py` gains a `codex` tool: `threads` index discovery in
+  `~/.codex/state_<n>.sqlite` with a `sessions/` scan fallback, zstd-compressed
+  rollouts (Python 3.14+ stdlib or the `zstd` binary), `compacted` replacement
+  history, `thread_rolled_back` handling, and `agent_message` sub-agent mail.
+- `--max-turns N` keeps the opening turns plus the most recent ones and elides
+  the middle, reported as a `turns_elided` warning. `/resume-codex` passes 120.
+
+### Changed
+- The reader, `CORE.md`, and the discover/pick/handoff flow are now shared
+  infrastructure (`scripts/session_reader.py`, `references/CORE.md`,
+  `extensions/resume-session.ts`) instead of living inside the Claude skill.
+  `extensions/resume-claude.ts` and `extensions/resume-codex.ts` only name the
+  target. Installed command names, flags, and behavior are unchanged.
+- Codex discovery excludes what `codex resume` also hides: non-interactive
+  (`exec`) threads, sub-agent and guardian-review threads, archived threads, and
+  stub rollouts that carry no `response_item`. On a real TimeHut store that turns
+  122 listed threads into 40 resumable sessions, none untitled.
+- Codex titles follow Codex's own label — user-assigned name, then title, then
+  the opening prompt — so `show` and the picker name a session the same way.
+
+### Fixed
+- Listing a Codex store with large compressed rollouts no longer decompresses
+  each `.jsonl.zst` in full to detect stub threads; a bounded head read keeps
+  discovery flat (4.3s to 0.1s on a store with a 215 MB rollout).
+- An unreadable or schema-incompatible `state_<n>.sqlite` now reports a
+  `codex_index_unusable` warning instead of reading as an empty session store.
+- `--max-turns 1` returns exactly one turn instead of two.
+- A reference that starts with `-` is passed after `--`, so a typo gets a
+  "no session matched" error rather than an argparse usage dump.
+- The `sessions/` scan fallback reports each session's recorded cwd instead of
+  the listing directory.
+
 ## 0.1.5
 
 ### UI

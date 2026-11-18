@@ -7,11 +7,13 @@ description: >
   Prefer the /resume-claude command when available.
 ---
 
-Set `TOOL=claude`. Set `SKILL_DIR` to this skill's directory (the folder that
-contains this `SKILL.md`).
+Set `TOOL=claude`. Set `PACKAGE_ROOT` to the package root (the directory that
+contains `scripts/session_reader.py` and `references/CORE.md`), which is this
+skill directory's parent's parent.
 
-Read and follow `references/CORE.md`, using any text after this skill block as
-the optional session reference (`latest` when empty).
+Read and follow `references/CORE.md` at `${PACKAGE_ROOT}/references/CORE.md`,
+using any text after this skill block as the optional session reference
+(`latest` when empty).
 
 When the `/resume-claude` extension command is available, prefer it: it runs the
 reader and injects inert session JSON directly.

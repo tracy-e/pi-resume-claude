@@ -1,12 +1,13 @@
 {
   "name": "pi-resume-claude",
   "version": "0.1.5",
-  "description": "Resume Claude Code sessions inside Pi via /resume-claude",
+  "description": "Resume Claude Code and Codex sessions inside Pi via /resume-claude and /resume-codex",
   "keywords": [
     "pi-package",
     "pi-coding-agent",
     "pi-extension",
     "claude-code",
+    "codex",
     "resume-session"
   ],
   "repository": {
@@ -21,19 +22,25 @@
   "type": "module",
   "files": [
     "extensions/resume-claude.ts",
+    "extensions/resume-codex.ts",
+    "extensions/resume-session.ts",
     "skills/resume-claude/SKILL.md",
-    "skills/resume-claude/references/CORE.md",
-    "skills/resume-claude/scripts/session_reader.py",
+    "skills/resume-codex/SKILL.md",
+    "references/CORE.md",
+    "scripts/session_reader.py",
     "README.md",
+    "CHANGELOG.md",
     "LICENSE",
     "NOTICE"
   ],
   "pi": {
     "extensions": [
-      "./extensions/resume-claude.ts"
+      "./extensions/resume-claude.ts",
+      "./extensions/resume-codex.ts"
     ],
     "skills": [
-      "./skills/resume-claude"
+      "./skills/resume-claude",
+      "./skills/resume-codex"
     ]
   },
   "scripts": {

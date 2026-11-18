@@ -8,8 +8,10 @@ Run with:  python3 -m unittest discover -s tests -p 'test_*.py'
 from __future__ import annotations
 
 import io
+import itertools
 import json
 import os
+import sqlite3
 import sys
 import unittest
 from contextlib import redirect_stdout, redirect_stderr
@@ -20,8 +22,6 @@ from unittest import mock
 _SCRIPTS_DIR = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
     "..",
-    "skills",
-    "resume-claude",
     "scripts",
 )
 sys.path.insert(0, _SCRIPTS_DIR)
@@ -270,6 +270,9 @@ class ClaudeParseTests(unittest.TestCase):
             _write_jsonl(path, records)
             result = sr.read_claude_session(path)
         self.assertEqual(result["title"], "/clear")
+        # The command is the user's request: keep it as a turn, not just a title.
+        self.assertEqual(result["turns"][0]["text"], "/clear")
+        self.assertEqual(result["last_user_request"], "/clear")
 
     def test_title_ignores_sidechain_user_records(self):
         """A sub-agent's internal prompt (isSidechain) must not become the title."""
@@ -417,6 +420,108 @@ class ClaudeParseTests(unittest.TestCase):
             "message_text_truncated", [w["code"] for w in result["warnings"]]
         )
 
+    def test_parent_chain_survives_interleaved_harness_records(self):
+        """Claude interleaves `attachment`/`progress` records into the
+        parentUuid chain. Dropping them (as non-conversational) severs the leaf
+        walk and leaves only the last turn or two."""
+        records = [
+            {
+                "type": "user",
+                "uuid": "u1",
+                "parentUuid": None,
+                "timestamp": "2026-07-20T10:00:00Z",
+                "cwd": FAKE_CWD,
+                "message": {"role": "user", "content": "start the task"},
+            },
+            {
+                "type": "attachment",
+                "uuid": "att1",
+                "parentUuid": "u1",
+                "timestamp": "2026-07-20T10:00:01Z",
+                "cwd": FAKE_CWD,
+            },
+            {
+                "type": "assistant",
+                "uuid": "a1",
+                "parentUuid": "att1",
+                "timestamp": "2026-07-20T10:00:02Z",
+                "cwd": FAKE_CWD,
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "working on it"}],
+                },
+            },
+        ]
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "s.jsonl"
+            _write_jsonl(path, records)
+            result = sr.read_claude_session(path)
+        self.assertEqual([turn["role"] for turn in result["turns"]], ["user", "assistant"])
+        self.assertEqual(result["last_user_request"], "start the task")
+
+    def test_malformed_message_and_type_do_not_crash(self):
+        """Foreign JSON is untrusted: a non-dict `message` or a non-string
+        `type` must degrade, not raise and lose the whole session."""
+        records = [
+            {
+                "type": "user",
+                "uuid": "u1",
+                "parentUuid": None,
+                "timestamp": "2026-07-20T10:00:00Z",
+                "cwd": FAKE_CWD,
+                "message": {"role": "user", "content": "hello"},
+            },
+            {
+                "type": "assistant",
+                "uuid": "a1",
+                "parentUuid": "u1",
+                "timestamp": "2026-07-20T10:00:01Z",
+                "cwd": FAKE_CWD,
+                "message": "not-a-dict",
+            },
+            {
+                "type": [],
+                "uuid": "bad",
+                "parentUuid": None,
+                "timestamp": "2026-07-20T10:00:02Z",
+                "cwd": FAKE_CWD,
+                "message": {"role": [], "content": [{"type": {}, "text": "x"}]},
+            },
+        ]
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "s.jsonl"
+            _write_jsonl(path, records)
+            result = sr.read_claude_session(path)
+        self.assertIn("hello", json.dumps(result))
+
+    def test_harness_metadata_types_are_not_reported_unknown(self):
+        records = _claude_records("Task")
+        known = [
+            "attachment",
+            "api-request",
+            "api-request-blob",
+            "permission-mode",
+            "atis-latch",
+            "tools-used",
+        ]
+        for index, record_type in enumerate(known):
+            records.append(
+                {
+                    "type": record_type,
+                    "uuid": f"harness-{index}",
+                    "parentUuid": None,
+                    "timestamp": f"2026-07-20T10:01:0{index}Z",
+                    "cwd": FAKE_CWD,
+                }
+            )
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "s.jsonl"
+            _write_jsonl(path, records)
+            result = sr.read_claude_session(path)
+        self.assertNotIn(
+            "unknown_records_skipped", [w["code"] for w in result["warnings"]]
+        )
+
 
 class DiscoverAndResolveTests(unittest.TestCase):
     def _build_store(self, tmp: str) -> None:
@@ -454,6 +559,12 @@ class DiscoverAndResolveTests(unittest.TestCase):
                 )
                 self.assertEqual(
                     sr.resolve_session("claude", "beta", FAKE_CWD)["session_id"], self.id_b
+                )
+                # A short id fragment matches too: filtering covers the id, not
+                # just the title (the TUI picker's haystack does the same).
+                self.assertEqual(
+                    sr.resolve_session("claude", self.id_b[:8], FAKE_CWD)["session_id"],
+                    self.id_b,
                 )
                 with self.assertRaises(sr.AmbiguousReference):
                     sr.resolve_session("claude", "e", FAKE_CWD)
@@ -656,6 +767,447 @@ class DiscoverAndResolveTests(unittest.TestCase):
         self.assertEqual([s["session_id"] for s in limited], [ids[3], ids[2]])
 
 
+FAKE_CODEX_ID = "0f0f0f0f-0f0f-4f0f-8f0f-0f0f0f0f0f0f"
+
+
+_CODEX_USER_IDS = itertools.count(1)
+
+
+def _codex_user(text: str) -> dict:
+    # Deterministic ids: hash() is salted per process, which would make the
+    # fixtures differ between runs.
+    return {
+        "type": "response_item",
+        "timestamp": "2026-07-20T10:00:01Z",
+        "payload": {
+            "type": "message",
+            "id": f"msg-user-{next(_CODEX_USER_IDS)}",
+            "role": "user",
+            "content": [{"type": "input_text", "text": text}],
+        },
+    }
+
+
+def _codex_records(prompt: str, cwd: str = FAKE_CWD, session_id: str = FAKE_CODEX_ID) -> list[dict]:
+    return [
+        {
+            "timestamp": "2026-07-20T10:00:00Z",
+            "type": "session_meta",
+            "payload": {
+                "id": session_id,
+                "session_id": session_id,
+                "timestamp": "2026-07-20T10:00:00Z",
+                "cwd": cwd,
+                "source": "cli",
+                "git": {"branch": "main", "commit_hash": "abc"},
+                "base_instructions": {"text": "You are Codex. SECRET BASE INSTRUCTIONS"},
+            },
+        },
+        # Harness-injected user turn: never a user request.
+        _codex_user("# AGENTS.md instructions for the repo\n<INSTRUCTIONS>be nice</INSTRUCTIONS>"),
+        {
+            "type": "turn_context",
+            "timestamp": "2026-07-20T10:00:01Z",
+            "payload": {"cwd": cwd, "approval_policy": "on-request", "model": "gpt-6"},
+        },
+        _codex_user(prompt),
+        {
+            "type": "response_item",
+            "timestamp": "2026-07-20T10:00:02Z",
+            "payload": {
+                "type": "reasoning",
+                "id": "rs1",
+                "summary": [],
+                "encrypted_content": "gAAAAsecretreasoning",
+            },
+        },
+        {
+            "type": "response_item",
+            "timestamp": "2026-07-20T10:00:03Z",
+            "payload": {
+                "type": "custom_tool_call",
+                "id": "ctc1",
+                "call_id": "call_1",
+                "name": "exec",
+                "status": "completed",
+                "input": "await tools.exec_command({cmd:'pytest -q'})",
+            },
+        },
+        {
+            "type": "response_item",
+            "timestamp": "2026-07-20T10:00:04Z",
+            "payload": {
+                "type": "custom_tool_call_output",
+                "id": "ctco1",
+                "call_id": "call_1",
+                "output": [
+                    {"type": "input_text", "text": "Script completed\nOutput:\n"},
+                    {"type": "input_text", "text": "3 passed"},
+                ],
+            },
+        },
+        {
+            "type": "response_item",
+            "timestamp": "2026-07-20T10:00:05Z",
+            "payload": {
+                "type": "message",
+                "id": "msg-a1",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "Tests pass."}],
+            },
+        },
+        # Stale duplicate of the same turn in the event stream: must not render twice.
+        {
+            "type": "event_msg",
+            "timestamp": "2026-07-20T10:00:05Z",
+            "payload": {
+                "type": "item_completed",
+                "item": {"type": "AgentMessage", "content": [{"type": "Text", "text": "Tests pass."}]},
+            },
+        },
+    ]
+
+
+class CodexParseTests(unittest.TestCase):
+    def test_basic_rollout(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / f"rollout-2026-07-20T10-00-00-{FAKE_CODEX_ID}.jsonl"
+            _write_jsonl(path, _codex_records("Add a feature"))
+            result = sr.read_codex_session(path)
+
+        self.assertEqual(result["tool"], "codex")
+        self.assertEqual(result["source"], "codex-cli")
+        self.assertEqual(result["session_id"], FAKE_CODEX_ID)
+        self.assertEqual(result["cwd"], FAKE_CWD)
+        self.assertEqual(result["branch"], "main")
+        # injected AGENTS.md turn, reasoning, and the duplicate event are gone
+        roles = [turn["role"] for turn in result["turns"]]
+        self.assertEqual(roles, ["user", "assistant", "tool", "assistant"])
+        self.assertEqual(result["turns"][0]["text"], "Add a feature")
+        self.assertEqual(result["turns"][1]["tool_calls"][0]["name"], "exec")
+        self.assertEqual(result["turns"][2]["tool_results"][0]["content"], "Script completed Output: 3 passed")
+        self.assertEqual(result["title"], "Add a feature")
+        self.assertEqual(result["last_user_request"], "Add a feature")
+        self.assertEqual(result["last_assistant_action"], "Tests pass.")
+        blob = json.dumps(result)
+        self.assertNotIn("SECRET BASE INSTRUCTIONS", blob)
+        self.assertNotIn("secretreasoning", blob)
+        self.assertNotIn("be nice", blob)
+        self.assertIn("unsafe_records_skipped", [w["code"] for w in result["warnings"]])
+
+    def test_compaction_uses_replacement_history(self):
+        records = _codex_records("fresh prompt after compaction")
+        # A pre-boundary turn that the compaction dropped: only the stored
+        # replacement history describes it afterwards.
+        records.insert(2, _codex_user("stale pre-compaction prompt"))
+        records.insert(
+            3,
+            {
+                "type": "compacted",
+                "timestamp": "2026-07-20T09:59:59Z",
+                "payload": {
+                    "message": "",
+                    "replacement_history": [_codex_user("older prompt kept by compaction")["payload"]],
+                },
+            },
+        )
+        # Only the records after the last boundary are live on top of it.
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "s.jsonl"
+            _write_jsonl(path, records)
+            result = sr.read_codex_session(path)
+        texts = [turn["text"] for turn in result["turns"] if turn["role"] == "user"]
+        self.assertEqual(texts, ["older prompt kept by compaction", "fresh prompt after compaction"])
+        self.assertIn("compacted_history_replaced", [w["code"] for w in result["warnings"]])
+
+    def test_pre_compaction_turns_are_dropped(self):
+        records = _codex_records("after")
+        records.insert(1, _codex_user("before compaction"))
+        # No `compacted` record: everything renders.
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "s.jsonl"
+            _write_jsonl(path, records)
+            self.assertEqual(
+                [t["text"] for t in sr.read_codex_session(path)["turns"] if t["role"] == "user"],
+                ["before compaction", "after"],
+            )
+            # With one, only the replacement history plus post-boundary turns remain.
+            records.insert(
+                3,
+                {
+                    "type": "compacted",
+                    "payload": {"replacement_history": [], "message": ""},
+                },
+            )
+            path = Path(tmp) / "t.jsonl"
+            _write_jsonl(path, records)
+            self.assertEqual(
+                [t["text"] for t in sr.read_codex_session(path)["turns"] if t["role"] == "user"],
+                ["after"],
+            )
+
+    def test_thread_rollback_drops_user_turns(self):
+        records = [
+            _codex_records("first")[0],
+            _codex_user("first"),
+            _codex_user("second"),
+            {
+                "type": "event_msg",
+                "payload": {"type": "thread_rolled_back", "num_turns": 1},
+            },
+        ]
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "s.jsonl"
+            _write_jsonl(path, records)
+            result = sr.read_codex_session(path)
+        self.assertEqual([t["text"] for t in result["turns"]], ["first"])
+
+    def test_turn_cap_keeps_head_and_tail(self):
+        records = [_codex_records("first")[0]]
+        records += [_codex_user(f"prompt {i}") for i in range(40)]
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "s.jsonl"
+            _write_jsonl(path, records)
+            capped = sr.read_codex_session(path, max_turns=8)
+            uncapped = sr.read_codex_session(path, max_turns=0)
+        self.assertEqual(len(uncapped["turns"]), 40)
+        self.assertEqual(len(capped["turns"]), 8)
+        self.assertEqual(capped["turns"][0]["text"], "prompt 0")
+        self.assertEqual(capped["turns"][-1]["text"], "prompt 39")
+        self.assertIn("turns_elided", [w["code"] for w in capped["warnings"]])
+        self.assertNotIn("turns_elided", [w["code"] for w in uncapped["warnings"]])
+
+    def test_turn_cap_one_keeps_only_the_stopping_point(self):
+        records = [_codex_records("first")[0]]
+        records += [_codex_user(f"prompt {i}") for i in range(4)]
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "s.jsonl"
+            _write_jsonl(path, records)
+            capped = sr.read_codex_session(path, max_turns=1)
+        self.assertEqual([t["text"] for t in capped["turns"]], ["prompt 3"])
+        self.assertIn("turns_elided", [w["code"] for w in capped["warnings"]])
+
+    def test_title_matches_the_indexed_list_label(self):
+        # `show` must reuse the picker's label (name -> title -> opening prompt),
+        # or the row the user picked and the handoff disagree.
+        with TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            sessions = home / "sessions" / "2026" / "07" / "20"
+            sessions.mkdir(parents=True)
+            path = sessions / f"rollout-2026-07-20T10-00-00-{FAKE_CODEX_ID}.jsonl"
+            _write_jsonl(path, _codex_records("opening real prompt"))
+            con = sqlite3.connect(home / "state_5.sqlite")
+            con.execute(
+                "CREATE TABLE threads (id TEXT, rollout_path TEXT, updated_at_ms INTEGER, "
+                "source TEXT, cwd TEXT, archived INTEGER, title TEXT, "
+                "first_user_message TEXT, name TEXT)"
+            )
+            con.execute(
+                "INSERT INTO threads VALUES (?,?,?,?,?,?,?,?,?)",
+                (
+                    FAKE_CODEX_ID,
+                    str(path),
+                    2_000_000,
+                    "cli",
+                    FAKE_CWD,
+                    0,
+                    "generated title",
+                    "opening real prompt",
+                    "replace-r50",
+                ),
+            )
+            con.commit()
+            con.close()
+            with mock.patch.dict(os.environ, {"CODEX_HOME": tmp}):
+                result = sr.read_codex_session(path)
+                listed = sr.discover_sessions("codex", FAKE_CWD)
+        self.assertEqual(result["title"], "replace-r50")
+        self.assertEqual(result["title"], listed[0]["title"])
+
+    def test_malformed_item_type_does_not_crash(self):
+        # Untrusted rollout: a non-string item type must not raise TypeError.
+        records = _codex_records("real prompt")
+        records.append({"type": "response_item", "payload": {"type": []}})
+        records.append({"type": [], "payload": {}})
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "s.jsonl"
+            _write_jsonl(path, records)
+            result = sr.read_codex_session(path)
+        self.assertEqual(result["turns"][0]["text"], "real prompt")
+
+    def test_message_text_cap(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "s.jsonl"
+            _write_jsonl(path, _codex_records("x" * 5000))
+            result = sr.read_codex_session(path, max_text_chars=50)
+        self.assertLessEqual(max(len(t["text"]) for t in result["turns"]), 50)
+        self.assertIn("message_text_truncated", [w["code"] for w in result["warnings"]])
+
+    def test_title_skips_injected_turns(self):
+        # Codex names a session after its opening real prompt; the leading
+        # AGENTS.md turn in _codex_records must not become the title.
+        records = _codex_records("real prompt")[:-1]
+        records.append(_codex_user("<environment_context>\n  <cwd>x</cwd>\n</environment_context>"))
+        self.assertEqual(sr._codex_first_prompt(records), "real prompt")
+        self.assertIsNone(sr._codex_first_prompt(records[1:2]))
+
+
+class CodexDiscoveryTests(unittest.TestCase):
+    def _build_store(self, tmp: str) -> None:
+        """Two Codex rollouts under a fake CODEX_HOME, newest first by mtime."""
+        self.id_a = "11111111-1111-4111-8111-111111111111"
+        self.id_b = "22222222-2222-4222-8222-222222222222"
+        sessions = Path(tmp) / "sessions" / "2026" / "07" / "20"
+        sessions.mkdir(parents=True)
+        path_a = sessions / f"rollout-2026-07-20T11-00-00-{self.id_a}.jsonl"
+        path_b = sessions / f"rollout-2026-07-20T10-00-00-{self.id_b}.jsonl"
+        _write_jsonl(path_a, _codex_records("Alpha feature work", session_id=self.id_a))
+        _write_jsonl(path_b, _codex_records("Beta bugfix", session_id=self.id_b))
+        # A stub thread: opened, never used (only session_meta).
+        stub = sessions / "rollout-2026-07-20T12-00-00-33333333-3333-4333-8333-333333333333.jsonl"
+        _write_jsonl(stub, _codex_records("unused", session_id="33333333-3333-4333-8333-333333333333")[:1])
+        os.utime(path_b, (1_000_000, 1_000_000))
+        os.utime(path_a, (2_000_000, 2_000_000))
+        os.utime(stub, (3_000_000, 3_000_000))
+
+    def test_discover_and_resolve(self):
+        with TemporaryDirectory() as tmp:
+            self._build_store(tmp)
+            with mock.patch.dict(os.environ, {"CODEX_HOME": tmp}):
+                sessions = sr.discover_sessions("codex", FAKE_CWD)
+                # The unused stub is not a resumable session.
+                self.assertEqual(
+                    [s["session_id"] for s in sessions], [self.id_a, self.id_b]
+                )
+                self.assertEqual(
+                    sr.resolve_session("codex", "latest", FAKE_CWD)["session_id"], self.id_a
+                )
+                for alias in ("continue", "--continue", "-c", "CONTINUE"):
+                    self.assertEqual(
+                        sr.resolve_session("codex", alias, FAKE_CWD)["session_id"], self.id_a
+                    )
+                self.assertEqual(
+                    sr.resolve_session("codex", self.id_b, FAKE_CWD)["session_id"], self.id_b
+                )
+                self.assertEqual(
+                    sr.resolve_session("codex", "beta", FAKE_CWD)["session_id"], self.id_b
+                )
+
+    def test_subdirectory_sessions_are_listed_from_parent(self):
+        sub_cwd = FAKE_CWD + "/apps/ios"
+        uid = "44444444-4444-4444-8444-444444444444"
+        with TemporaryDirectory() as tmp:
+            sessions = Path(tmp) / "sessions" / "2026" / "07" / "20"
+            sessions.mkdir(parents=True)
+            _write_jsonl(
+                sessions / f"rollout-2026-07-20T10-00-00-{uid}.jsonl",
+                _codex_records("ios work", cwd=sub_cwd, session_id=uid),
+            )
+            with mock.patch.dict(os.environ, {"CODEX_HOME": tmp}):
+                sessions = sr.discover_sessions("codex", FAKE_CWD)
+                ids = [s["session_id"] for s in sessions]
+                # ... but not from a sibling directory.
+                sibling = [s["session_id"] for s in sr.discover_sessions("codex", FAKE_CWD + "/apps/agent")]
+        self.assertIn(uid, ids)
+        # The handoff reports where the session actually ran, not the listing cwd.
+        self.assertEqual([s["cwd"] for s in sessions], [sub_cwd])
+        self.assertNotIn(uid, sibling)
+
+    def test_foreign_cwd_is_not_listed(self):
+        with TemporaryDirectory() as tmp:
+            sessions = Path(tmp) / "sessions" / "2026" / "07" / "20"
+            sessions.mkdir(parents=True)
+            _write_jsonl(
+                sessions / "rollout-2026-07-20T10-00-00-55555555-5555-4555-8555-555555555555.jsonl",
+                _codex_records("theirs", cwd="/some/other/place"),
+            )
+            with mock.patch.dict(os.environ, {"CODEX_HOME": tmp}):
+                self.assertEqual(sr.discover_sessions("codex", FAKE_CWD), [])
+
+    def test_state_database_drives_discovery(self):
+        """The threads index is the primary source; only interactive threads count."""
+        uid = "66666666-6666-4666-8666-666666666666"
+        sub_uid = "77777777-7777-4777-8777-777777777777"
+        with TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            sessions = home / "sessions" / "2026" / "07" / "20"
+            sessions.mkdir(parents=True)
+            rollout = sessions / f"rollout-2026-07-20T10-00-00-{uid}.jsonl"
+            _write_jsonl(rollout, _codex_records("indexed", session_id=uid))
+            sub_rollout = sessions / f"rollout-2026-07-20T10-00-00-{sub_uid}.jsonl"
+            _write_jsonl(
+                sub_rollout,
+                _codex_records("indexed subdir", cwd=FAKE_CWD + "/apps/ios", session_id=sub_uid),
+            )
+            database = home / "state_5.sqlite"
+            con = sqlite3.connect(database)
+            con.execute(
+                "CREATE TABLE threads (id TEXT, rollout_path TEXT, updated_at_ms INTEGER, "
+                "source TEXT, cwd TEXT, archived INTEGER, title TEXT, "
+                "first_user_message TEXT, git_branch TEXT, name TEXT, thread_source TEXT)"
+            )
+            rows = [
+                (uid, str(rollout), 2_000_000, "cli", FAKE_CWD, 0, "indexed", "", "main", None, "user"),
+                (sub_uid, str(sub_rollout), 1_000_000, "vscode", FAKE_CWD + "/apps/ios", 0, "", "sub", None, None, "user"),
+                # Harness-spawned thread: same cwd, not a user conversation.
+                ("88888888-8888-4888-8888-888888888888", str(rollout), 3_000_000,
+                 '{"subagent":{"other":"guardian"}}', FAKE_CWD, 0, "Guardian review", "", None, None,
+                 "guardian_review"),
+                # Archived thread.
+                ("99999999-9999-4999-8999-999999999999", str(rollout), 4_000_000, "cli", FAKE_CWD, 1,
+                 "archived", "", None, None, "user"),
+            ]
+            con.executemany("INSERT INTO threads VALUES (?,?,?,?,?,?,?,?,?,?,?)", rows)
+            con.commit()
+            con.close()
+            with mock.patch.dict(os.environ, {"CODEX_HOME": tmp}):
+                sessions = sr.discover_sessions("codex", FAKE_CWD)
+                ids = [s["session_id"] for s in sessions]
+                self.assertEqual(ids, [uid, sub_uid])
+                self.assertEqual(sessions[0]["title"], "indexed")
+                self.assertEqual(sessions[0]["branch"], "main")
+                self.assertEqual(sessions[1]["title"], "sub")
+                # Native id resolution goes through the index too.
+                self.assertEqual(
+                    sr.resolve_session("codex", sub_uid, FAKE_CWD)["session_id"], sub_uid
+                )
+
+    def test_unusable_index_falls_back_to_file_scan(self):
+        """A corrupt/locked thread index must degrade to scanning sessions/."""
+        uid = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+        with TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            sessions = home / "sessions" / "2026" / "07" / "20"
+            sessions.mkdir(parents=True)
+            _write_jsonl(
+                sessions / f"rollout-2026-07-20T10-00-00-{uid}.jsonl",
+                _codex_records("scanned", session_id=uid),
+            )
+            # Not a SQLite database: opening it raises. Discovery must not fail.
+            (home / "state_5.sqlite").write_bytes(b"not a database at all")
+            with mock.patch.dict(os.environ, {"CODEX_HOME": tmp}):
+                ids = [s["session_id"] for s in sr.discover_sessions("codex", FAKE_CWD)]
+        self.assertEqual(ids, [uid])
+
+    def test_zstd_rollout_is_readable(self):
+        try:
+            from compression import zstd  # noqa: F401
+        except ImportError:
+            self.skipTest("stdlib compression.zstd requires Python 3.14+")
+        uid = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        with TemporaryDirectory() as tmp:
+            sessions = Path(tmp) / "sessions" / "2026" / "07" / "20"
+            sessions.mkdir(parents=True)
+            path = sessions / f"rollout-2026-07-20T10-00-00-{uid}.jsonl.zst"
+            body = "\n".join(json.dumps(r) for r in _codex_records("archived work", session_id=uid))
+            path.write_bytes(zstd.compress(body.encode("utf-8")))
+            with mock.patch.dict(os.environ, {"CODEX_HOME": tmp}):
+                ids = [s["session_id"] for s in sr.discover_sessions("codex", FAKE_CWD)]
+                result = sr.read_codex_session(path)
+        self.assertIn(uid, ids)
+        self.assertEqual(result["turns"][0]["text"], "archived work")
+
+
 class CliTests(unittest.TestCase):
     def _run(self, argv: list[str]) -> tuple[int, str, str]:
         out, err = io.StringIO(), io.StringIO()
@@ -690,6 +1242,27 @@ class CliTests(unittest.TestCase):
         _write_jsonl(projects / "11111111-1111-4111-8111-111111111111.jsonl", _claude_records("Edge case"))
         _write_jsonl(projects / "22222222-2222-4222-8222-222222222222.jsonl", _claude_records("Elder scroll"))
 
+    def test_claude_turn_cap_keeps_head_and_tail(self):
+        records = []
+        for i in range(30):
+            records.append(
+                {
+                    "type": "user",
+                    "uuid": f"u{i}",
+                    "parentUuid": None if i == 0 else f"u{i - 1}",
+                    "timestamp": f"2026-07-20T10:{i:02d}:00Z",
+                    "cwd": FAKE_CWD,
+                    "message": {"role": "user", "content": [{"type": "text", "text": f"p{i}"}]},
+                }
+            )
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "s.jsonl"
+            _write_jsonl(path, records)
+            result = sr.read_claude_session(path, max_turns=8)
+        self.assertEqual(len(result["turns"]), 8)
+        self.assertEqual(result["turns"][0]["text"], "p0")
+        self.assertEqual(result["turns"][-1]["text"], "p29")
+
     def test_cli_ambiguous_json_returns_structured_matches(self):
         with TemporaryDirectory() as tmp:
             self._build_ambiguous_store(tmp)
@@ -714,6 +1287,68 @@ class CliTests(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertEqual(out, "")
         self.assertIn("matched", err)
+
+    def test_cli_codex_list_and_show(self):
+        uid = "12121212-1212-4212-8212-121212121212"
+        with TemporaryDirectory() as tmp:
+            sessions = Path(tmp) / "sessions" / "2026" / "07" / "20"
+            sessions.mkdir(parents=True)
+            _write_jsonl(
+                sessions / f"rollout-2026-07-20T10-00-00-{uid}.jsonl",
+                _codex_records("Only one codex session", session_id=uid),
+            )
+            with mock.patch.dict(os.environ, {"CODEX_HOME": tmp}):
+                code, out, _ = self._run(["codex", "list", "--cwd", FAKE_CWD, "--json"])
+                self.assertEqual(code, 0)
+                self.assertEqual(len(json.loads(out)["sessions"]), 1)
+
+                code, out, _ = self._run(["codex", "show", "latest", "--cwd", FAKE_CWD, "--json"])
+                self.assertEqual(code, 0)
+                payload = json.loads(out)
+                self.assertEqual(payload["tool"], "codex")
+                self.assertEqual(payload["session_id"], uid)
+                self.assertEqual(payload["turns"][0]["text"], "Only one codex session")
+
+    def test_cli_codex_list_warns_when_index_is_unusable(self):
+        uid = "34343434-3434-4434-8434-343434343434"
+        with TemporaryDirectory() as tmp:
+            sessions = Path(tmp) / "sessions" / "2026" / "07" / "20"
+            sessions.mkdir(parents=True)
+            _write_jsonl(
+                sessions / f"rollout-2026-07-20T10-00-00-{uid}.jsonl",
+                _codex_records("scanned", session_id=uid),
+            )
+            # A corrupt index must degrade to the file scan *and* say so, instead
+            # of reading as an empty store.
+            (Path(tmp) / "state_5.sqlite").write_bytes(b"not a database at all")
+            with mock.patch.dict(os.environ, {"CODEX_HOME": tmp}):
+                code, out, _ = self._run(["codex", "list", "--cwd", FAKE_CWD, "--json"])
+        payload = json.loads(out)
+        self.assertEqual(code, 0)
+        self.assertEqual([s["session_id"] for s in payload["sessions"]], [uid])
+        self.assertEqual(
+            [w["code"] for w in payload["warnings"]], ["codex_index_unusable"]
+        )
+
+    def test_cli_show_accepts_a_dashed_reference_after_separator(self):
+        # The extension passes `-- <ref>` so a leading dash becomes a literal
+        # reference (readable "no match") instead of an argparse usage dump.
+        with TemporaryDirectory() as tmp:
+            projects = Path(tmp) / "projects" / sr.slugify(FAKE_CWD)
+            projects.mkdir(parents=True)
+            _write_jsonl(
+                projects / "11111111-1111-4111-8111-111111111111.jsonl",
+                _claude_records("Only one"),
+            )
+            with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": tmp}):
+                code, out, err = self._run(
+                    ["claude", "show", "--cwd", FAKE_CWD, "--json", "--", "--foo"]
+                )
+        self.assertEqual(code, 2)
+        self.assertEqual(err, "")
+        payload = json.loads(out)
+        self.assertEqual(payload["error"], "reader_error")
+        self.assertIn("--foo", payload["message"])
 
     def test_cli_reader_error_json_is_structured(self):
         # A non-ambiguous failure under --json must still be parseable JSON on
